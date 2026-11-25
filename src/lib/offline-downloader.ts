@@ -2,9 +2,13 @@
  * 服务器端离线下载器
  * 用于在服务器端下载 M3U8 视频到本地文件系统
  */
+/* eslint-disable no-console */
 
+import { type ChildProcess,spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { pipeline } from 'stream/promises';
 import { URL } from 'url';
 
 import { safeFetch } from './safe-http';
@@ -16,7 +20,7 @@ export interface OfflineDownloadTask {
   episodeIndex: number;
   title: string;
   m3u8Url: string;
-  status: 'pending' | 'downloading' | 'completed' | 'error' | 'paused';
+  status: 'pending' | 'downloading' | 'remuxing' | 'completed' | 'error' | 'paused';
   progress: number;
   totalSegments: number;
   downloadedSegments: number;
@@ -24,6 +28,7 @@ export interface OfflineDownloadTask {
   createdAt: Date;
   updatedAt: Date;
   downloadDir: string;
+  playbackId?: string;
   // 视频元数据
   metadata?: {
     videoTitle?: string; // 视频总标题（如：某某动漫）
@@ -47,23 +52,61 @@ interface KeyInfo {
   iv?: string;
 }
 
+function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
+  const abortSignalConstructor = AbortSignal as typeof AbortSignal & {
+    any?: (signals: AbortSignal[]) => AbortSignal;
+  };
+  if (typeof abortSignalConstructor.any === 'function') {
+    return abortSignalConstructor.any(signals);
+  }
+
+  const controller = new AbortController();
+  const forwardAbort = (signal: AbortSignal) => {
+    if (!controller.signal.aborted) controller.abort(signal.reason);
+  };
+  const listeners = signals.map((signal) => {
+    const listener = () => forwardAbort(signal);
+    signal.addEventListener('abort', listener, { once: true });
+    return { signal, listener };
+  });
+  controller.signal.addEventListener(
+    'abort',
+    () => {
+      for (const entry of listeners) {
+        entry.signal.removeEventListener('abort', entry.listener);
+      }
+    },
+    { once: true }
+  );
+  for (const signal of signals) {
+    if (signal.aborted) {
+      forwardAbort(signal);
+      break;
+    }
+  }
+  return controller.signal;
+}
+
 export class OfflineDownloader {
   private baseDir: string;
+  private exportDir: string | undefined;
   private maxRetries = 3;
   private retryDelay = 1000; // ms
   private concurrency = 6;
   private proxy?: string;
+  private childProcesses = new Map<string, ChildProcess>();
 
-  constructor(baseDir: string, proxy?: string) {
+  constructor(baseDir: string, proxy?: string, exportDir?: string) {
     this.baseDir = baseDir;
     this.proxy = proxy?.trim() || undefined;
+    this.exportDir = exportDir?.trim() ? path.resolve(exportDir.trim()) : undefined;
     this.ensureDir(this.baseDir);
   }
 
   /**
    * 创建下载任务
    */
-  async createTask(
+  createTask(
     source: string,
     videoId: string,
     episodeIndex: number,
@@ -77,9 +120,9 @@ export class OfflineDownloader {
       rating?: number;
       totalEpisodes?: number;
     }
-  ): Promise<OfflineDownloadTask> {
-    const taskId = `${source}_${videoId}_${episodeIndex}_${Date.now()}`;
-    const downloadDir = path.join(this.baseDir, source, videoId, `ep${episodeIndex + 1}`);
+  ): OfflineDownloadTask {
+    const taskId = `${source}_${videoId}_${episodeIndex}_${Date.now()}_${randomUUID()}`;
+    const downloadDir = this.getDownloadDirectory(source, videoId, episodeIndex);
 
     const task: OfflineDownloadTask = {
       id: taskId,
@@ -95,6 +138,7 @@ export class OfflineDownloader {
       createdAt: new Date(),
       updatedAt: new Date(),
       downloadDir,
+      playbackId: this.exportDir ? randomUUID() : undefined,
       metadata,
     };
 
@@ -106,9 +150,12 @@ export class OfflineDownloader {
    */
   async startDownload(
     task: OfflineDownloadTask,
-    onProgress?: (task: OfflineDownloadTask) => void
+    onProgress?: (task: OfflineDownloadTask) => void,
+    signal?: AbortSignal,
+    shouldExport = false
   ): Promise<void> {
     try {
+      this.throwIfAborted(signal);
       task.status = 'downloading';
       task.updatedAt = new Date();
       onProgress?.(task);
@@ -122,7 +169,7 @@ export class OfflineDownloader {
         // 检查所有文件是否完整
         const isComplete = await this.verifyDownload(task.downloadDir);
         if (isComplete) {
-          task.status = 'completed';
+          task.status = shouldExport ? 'remuxing' : 'completed';
           task.progress = 100;
           task.updatedAt = new Date();
           onProgress?.(task);
@@ -131,7 +178,7 @@ export class OfflineDownloader {
       }
 
       // 下载 M3U8 文件
-      let m3u8Content = await this.fetchContent(task.m3u8Url);
+      let m3u8Content = await this.fetchContent(task.m3u8Url, signal);
       let finalM3u8Url = task.m3u8Url;
 
       // 检查是否为主播放列表（包含多个分辨率）
@@ -146,7 +193,7 @@ export class OfflineDownloader {
           finalM3u8Url = bestVariantUrl;
 
           // 下载子播放列表
-          m3u8Content = await this.fetchContent(bestVariantUrl);
+          m3u8Content = await this.fetchContent(bestVariantUrl, signal);
         } else {
           console.warn('无法找到子播放列表，使用原始URL');
         }
@@ -155,29 +202,37 @@ export class OfflineDownloader {
       // 解析 M3U8 文件
       const { segments, keyInfo } = this.parseM3U8(m3u8Content, finalM3u8Url);
 
+      if (segments.length === 0) {
+        throw new Error('M3U8 播放列表中没有可下载的视频分片');
+      }
+
       task.totalSegments = segments.length;
       onProgress?.(task);
 
       // 下载解密 Key（如果有）
       if (keyInfo && keyInfo.uri) {
-        await this.downloadKey(keyInfo, task.downloadDir);
+        await this.downloadKey(keyInfo, task.downloadDir, signal);
       }
 
       // 下载所有片段
-      await this.downloadSegments(segments, task, onProgress);
+      await this.downloadSegments(segments, task, onProgress, signal);
+
+      this.throwIfAborted(signal);
 
       // 生成本地播放列表，保持原始格式
       this.generateLocalPlaylist(m3u8Content, segments, keyInfo, task.downloadDir);
 
-      task.status = 'completed';
+      task.status = shouldExport ? 'remuxing' : 'completed';
       task.progress = 100;
       task.updatedAt = new Date();
       onProgress?.(task);
     } catch (error) {
-      task.status = 'error';
-      task.errorMessage = error instanceof Error ? error.message : String(error);
-      task.updatedAt = new Date();
-      onProgress?.(task);
+      if (!signal?.aborted) {
+        task.status = 'error';
+        task.errorMessage = this.formatError(error);
+        task.updatedAt = new Date();
+        onProgress?.(task);
+      }
       throw error;
     }
   }
@@ -320,16 +375,19 @@ export class OfflineDownloader {
   private async downloadSegments(
     segments: SegmentInfo[],
     task: OfflineDownloadTask,
-    onProgress?: (task: OfflineDownloadTask) => void
+    onProgress?: (task: OfflineDownloadTask) => void,
+    signal?: AbortSignal
   ): Promise<void> {
     const queue = [...segments];
     const downloading: Promise<void>[] = [];
     let downloadedCount = 0;
 
     const downloadNext = async (): Promise<void> => {
+      this.throwIfAborted(signal);
       if (queue.length === 0) return;
 
-      const segment = queue.shift()!;
+      const segment = queue.shift();
+      if (!segment) return;
       const segmentPath = path.join(task.downloadDir, segment.filename);
 
       // 如果文件已存在且大小 > 0，跳过下载
@@ -343,7 +401,7 @@ export class OfflineDownloader {
       }
 
       // 下载片段（带重试）
-      await this.downloadWithRetry(segment.url, segmentPath);
+      await this.downloadWithRetry(segment.url, segmentPath, signal);
 
       downloadedCount++;
       task.downloadedSegments = downloadedCount;
@@ -359,13 +417,17 @@ export class OfflineDownloader {
       downloading.push(downloadNext());
     }
 
-    await Promise.all(downloading);
+    const results = await Promise.allSettled(downloading);
+    const failed = results.find(
+      (result): result is PromiseRejectedResult => result.status === 'rejected'
+    );
+    if (failed) throw failed.reason;
   }
 
   /**
    * 下载解密 Key
    */
-  private async downloadKey(keyInfo: KeyInfo, downloadDir: string): Promise<void> {
+  private async downloadKey(keyInfo: KeyInfo, downloadDir: string, signal?: AbortSignal): Promise<void> {
     if (!keyInfo.uri) return;
 
     const keyPath = path.join(downloadDir, 'key.key');
@@ -375,22 +437,24 @@ export class OfflineDownloader {
       return;
     }
 
-    await this.downloadWithRetry(keyInfo.uri, keyPath);
+    await this.downloadWithRetry(keyInfo.uri, keyPath, signal);
   }
 
   /**
    * 下载文件（带重试）
    */
-  private async downloadWithRetry(url: string, savePath: string): Promise<void> {
+  private async downloadWithRetry(url: string, savePath: string, signal?: AbortSignal): Promise<void> {
     let lastError: Error | null = null;
 
     for (let attempt = 0; attempt < this.maxRetries; attempt++) {
+      this.throwIfAborted(signal);
       try {
-        await this.downloadFile(url, savePath);
+        await this.downloadFile(url, savePath, signal);
         return;
       } catch (error) {
+        if (signal?.aborted) throw error;
         lastError = error instanceof Error ? error : new Error(String(error));
-        console.error(`下载失败 (尝试 ${attempt + 1}/${this.maxRetries}): ${url}`, error);
+        console.error(`下载失败 (尝试 ${attempt + 1}/${this.maxRetries})`, error);
 
         if (attempt < this.maxRetries - 1) {
           await this.sleep(this.retryDelay * (attempt + 1));
@@ -430,29 +494,37 @@ export class OfflineDownloader {
     );
   }
 
-  private getRequestOptions(url: string, timeout = 30000): RequestInit {
+  private getRequestOptions(url: string, timeout = 30000, signal?: AbortSignal): RequestInit {
+    const timeoutSignal = AbortSignal.timeout(timeout);
+    const combinedSignal = signal
+      ? combineAbortSignals([signal, timeoutSignal])
+      : timeoutSignal;
     return {
       headers: this.getHeaders(url),
-      signal: AbortSignal.timeout(timeout) as unknown as RequestInit['signal'],
+      signal: combinedSignal as unknown as RequestInit['signal'],
     };
   }
 
-  private async fetchUrl(url: string, timeout = 30000): Promise<Response> {
+  private async fetchUrl(url: string, timeout = 30000, signal?: AbortSignal): Promise<Response> {
     if (this.isCloudflareEnvironment()) {
+      const timeoutSignal = AbortSignal.timeout(timeout);
+      const combinedSignal = signal
+        ? combineAbortSignals([signal, timeoutSignal])
+        : timeoutSignal;
       return fetch(url, {
         headers: this.getHeaders(url),
-        signal: AbortSignal.timeout(timeout),
+        signal: combinedSignal,
       });
     }
 
-    return safeFetch(url, this.getRequestOptions(url, timeout), this.proxy) as unknown as Promise<Response>;
+    return safeFetch(url, this.getRequestOptions(url, timeout, signal), this.proxy) as unknown as Promise<Response>;
   }
 
   /**
    * 下载单个文件
    */
-  private async downloadFile(url: string, savePath: string): Promise<void> {
-    const response = await this.fetchUrl(url, 30000);
+  private async downloadFile(url: string, savePath: string, signal?: AbortSignal): Promise<void> {
+    const response = await this.fetchUrl(url, 30000, signal);
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
@@ -462,47 +534,339 @@ export class OfflineDownloader {
       throw new Error('响应体为空');
     }
 
-    const body = (await (response as any).getBody?.()) ??
+    const responseWithNodeBody = response as Response & {
+      getBody?: () =>
+        | Promise<NodeJS.ReadableStream | null>
+        | NodeJS.ReadableStream
+        | null;
+    };
+    const body =
+      (await responseWithNodeBody.getBody?.()) ??
       (response.body as unknown as NodeJS.ReadableStream | null);
 
     if (!body || typeof body.pipe !== 'function') {
       const arrayBuffer = await response.arrayBuffer();
+      this.throwIfAborted(signal);
       fs.writeFileSync(savePath, Buffer.from(arrayBuffer));
       return;
     }
 
-    await new Promise<void>((resolve, reject) => {
-      const fileStream = fs.createWriteStream(savePath);
-      body.pipe(fileStream);
-
-      fileStream.on('finish', () => {
-        fileStream.close();
-        resolve();
-      });
-
-      const handleError = (err: Error) => {
-        fs.unlink(savePath, () => {
-          // Ignore unlink errors
-        });
-        reject(err);
-      };
-
-      fileStream.on('error', handleError);
-      body.on('error', handleError);
-    });
+    const fileStream = fs.createWriteStream(savePath);
+    try {
+      await pipeline(body, fileStream, signal ? { signal } : {});
+    } catch (error) {
+      await fs.promises.rm(savePath, { force: true });
+      throw error;
+    }
   }
 
   /**
    * 获取内容（用于 M3U8 文件）
    */
-  private async fetchContent(url: string): Promise<string> {
-    const response = await this.fetchUrl(url, 10000);
+  private async fetchContent(url: string, signal?: AbortSignal): Promise<string> {
+    const response = await this.fetchUrl(url, 10000, signal);
 
     if (!response.ok) {
       throw new Error(`HTTP ${response.status}`);
     }
 
     return response.text();
+  }
+
+  async remuxToMp4(task: OfflineDownloadTask, signal?: AbortSignal): Promise<void> {
+    if (!this.exportDir) throw new Error('服务器 MP4 发布目录未配置');
+    this.throwIfAborted(signal);
+    if (!task.playbackId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(task.playbackId)) {
+      throw new Error('缓存链接标识无效');
+    }
+
+    const outputPath = this.getPublishedPath(task.playbackId);
+    this.ensureDir(this.exportDir);
+    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) return;
+
+    const playlistPath = path.join(task.downloadDir, 'playlist.m3u8');
+    if (!await this.verifyDownload(task.downloadDir)) {
+      throw new Error('本地 HLS 缓存不完整，无法生成 MP4');
+    }
+    const tempPlaylist = path.join(task.downloadDir, `remux-${task.playbackId}.m3u8`);
+    const tempOutput = path.join(this.exportDir, `.${task.playbackId}.${randomUUID()}.part.mp4`);
+    const localLines = this.createRemuxPlaylist(playlistPath, task.downloadDir);
+    fs.writeFileSync(tempPlaylist, localLines.join('\n') + '\n', 'utf-8');
+
+    try {
+      const outputBytes = await this.getAvailableOutputBytes(task.downloadDir);
+      const minimumFreeBytes = Math.max(32 * 1024 * 1024, outputBytes * 1.1 + 8 * 1024 * 1024);
+      const filesystemStats = await fs.promises.statfs(this.exportDir);
+      const availableBytes = Number(filesystemStats.bavail) * Number(filesystemStats.bsize);
+      if (availableBytes < minimumFreeBytes) {
+        throw new Error('服务器磁盘剩余空间不足，MP4 封装暂未开始；已缓存的 HLS 分片仍可在 MoonTVPlus 内播放');
+      }
+
+      const probeOutput = await this.runProcess('ffprobe', task.id, [
+        '-v', 'error',
+        '-protocol_whitelist', 'file,crypto,data',
+        '-allowed_extensions', 'ALL',
+        '-show_entries', 'stream=codec_type,codec_name',
+        '-of', 'json',
+        tempPlaylist,
+      ], signal);
+      const streams = (JSON.parse(probeOutput) as { streams?: { codec_type?: string; codec_name?: string }[] }).streams || [];
+      const videoCodec = streams.find((stream) => stream.codec_type === 'video')?.codec_name;
+      const audioCodecs = streams.filter((stream) => stream.codec_type === 'audio').map((stream) => stream.codec_name);
+      if (videoCodec !== 'h264' || audioCodecs.some((codec) => codec !== 'aac')) {
+        const audioText = audioCodecs.length > 0 ? audioCodecs.join(', ') : '无音轨';
+        throw new Error(`检测到视频编码 ${videoCodec || '未知'}、音频编码 ${audioText}，当前不能保证手机和电脑浏览器播放。原 HLS 缓存仍保留，可在 MoonTVPlus 内播放`);
+      }
+
+      await this.runProcess('ffmpeg', task.id, [
+        '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+        '-protocol_whitelist', 'file,crypto,data',
+        '-allowed_extensions', 'ALL',
+        '-i', tempPlaylist,
+        '-map', '0:v:0', '-map', '0:a?',
+        '-c', 'copy', '-movflags', '+faststart',
+        '-f', 'mp4', tempOutput,
+      ], signal);
+      this.throwIfAborted(signal);
+      const exportedStats = await fs.promises.stat(tempOutput);
+      if (exportedStats.size === 0) throw new Error('FFmpeg 封装完成，但生成的 MP4 文件为空');
+      await fs.promises.rename(tempOutput, outputPath);
+    } catch (error) {
+      await fs.promises.rm(tempOutput, { force: true });
+      const message = this.formatError(error);
+      if (message.includes('space left') || (error as NodeJS.ErrnoException).code === 'ENOSPC') {
+        throw new Error('服务器磁盘空间不足，MP4 封装失败；HLS 缓存仍保留，可在 MoonTVPlus 内播放');
+      }
+      throw new Error(message);
+    } finally {
+      this.childProcesses.delete(task.id);
+      await fs.promises.rm(tempPlaylist, { force: true });
+    }
+  }
+
+  getPlaybackUrl(task: OfflineDownloadTask): string | undefined {
+    if (!this.exportDir || !task.playbackId) return undefined;
+    const outputPath = this.getPublishedPath(task.playbackId);
+    if (!fs.existsSync(outputPath)) return undefined;
+    try {
+      if (fs.statSync(outputPath).size === 0) return undefined;
+    } catch {
+      return undefined;
+    }
+    return `/media/${task.playbackId}.mp4`;
+  }
+
+  getOrCreatePlaybackId(task: OfflineDownloadTask): string {
+    task.playbackId ||= randomUUID();
+    return task.playbackId;
+  }
+
+  requestCancel(taskId: string): void {
+    const child = this.childProcesses.get(taskId);
+    if (child && child.exitCode === null && child.signalCode === null) {
+      child.kill('SIGTERM');
+    }
+  }
+
+  private async getAvailableOutputBytes(downloadDir: string): Promise<number> {
+    let total = 0;
+    for (const entry of await fs.promises.readdir(downloadDir, { withFileTypes: true })) {
+      if (!entry.isFile() || !/^segment_\d+\.ts$/i.test(entry.name)) continue;
+      total += (await fs.promises.stat(path.join(downloadDir, entry.name))).size;
+    }
+    return total;
+  }
+
+  private createRemuxPlaylist(playlistPath: string, downloadDir: string): string[] {
+    const sourceLines = fs.readFileSync(playlistPath, 'utf-8').split(/\r?\n/);
+    const remuxLines = ['#EXTM3U', '#EXT-X-PLAYLIST-TYPE:VOD'];
+    let duration = '';
+    let segmentCount = 0;
+    let hasEncryptionKey = false;
+
+    for (const rawLine of sourceLines) {
+      const line = rawLine.trim();
+      if (!line) continue;
+
+      if (line.startsWith('#EXT-X-MAP:') || line.startsWith('#EXT-X-BYTERANGE:')) {
+        throw new Error('该片源使用 fMP4 初始化段或字节范围，当前无法封装为浏览器播放文件');
+      }
+
+      if (line.startsWith('#EXT-X-KEY:')) {
+        const method = line.match(/METHOD=([^,]+)/i)?.[1]?.trim().toUpperCase();
+        if (method === 'NONE') {
+          remuxLines.push('#EXT-X-KEY:METHOD=NONE');
+          hasEncryptionKey = false;
+          continue;
+        }
+        if (method !== 'AES-128') {
+          throw new Error('该片源使用浏览器兼容模式无法处理的加密方式，HLS 缓存仍可在 MoonTVPlus 内播放');
+        }
+
+        const keyFormat = line.match(/KEYFORMAT="?([^,"]+)/i)?.[1]?.trim();
+        if (keyFormat && keyFormat.toLowerCase() !== 'identity') {
+          throw new Error('该片源使用浏览器兼容模式无法处理的密钥格式，HLS 缓存仍可在 MoonTVPlus 内播放');
+        }
+
+        const keyPath = path.join(downloadDir, 'key.key');
+        if (!fs.existsSync(keyPath) || fs.statSync(keyPath).size === 0) {
+          throw new Error('本地 AES-128 密钥缺失，无法生成 MP4');
+        }
+        const iv = line.match(/IV=(0x[0-9a-f]+)(?:,|$)/i)?.[1];
+        remuxLines.push(`#EXT-X-KEY:METHOD=AES-128,URI="key.key"${iv ? `,IV=${iv}` : ''}`);
+        hasEncryptionKey = true;
+        continue;
+      }
+
+      const extinfMatch = line.match(/^#EXTINF:([0-9]+(?:\.[0-9]+)?)(?:,.*)?$/i);
+      if (extinfMatch) {
+        duration = extinfMatch[1];
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-VERSION:')) {
+        const version = line.slice('#EXT-X-VERSION:'.length).trim();
+        if (/^\d+$/.test(version)) remuxLines.push(`#EXT-X-VERSION:${version}`);
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-TARGETDURATION:')) {
+        const targetDuration = line.slice('#EXT-X-TARGETDURATION:'.length).trim();
+        if (/^\d+$/.test(targetDuration)) remuxLines.push(`#EXT-X-TARGETDURATION:${targetDuration}`);
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+        const sequence = line.slice('#EXT-X-MEDIA-SEQUENCE:'.length).trim();
+        if (/^\d+$/.test(sequence)) remuxLines.push(`#EXT-X-MEDIA-SEQUENCE:${sequence}`);
+        continue;
+      }
+
+      if (line.startsWith('#EXT-X-DISCONTINUITY-SEQUENCE:')) {
+        const sequence = line.slice('#EXT-X-DISCONTINUITY-SEQUENCE:'.length).trim();
+        if (/^\d+$/.test(sequence)) remuxLines.push(`#EXT-X-DISCONTINUITY-SEQUENCE:${sequence}`);
+        continue;
+      }
+
+      if (line === '#EXT-X-DISCONTINUITY' || line === '#EXT-X-INDEPENDENT-SEGMENTS') {
+        remuxLines.push(line);
+        continue;
+      }
+
+      if (line.startsWith('#')) continue;
+      if (!/^segment_\d+\.ts$/i.test(line) || path.basename(line) !== line) {
+        throw new Error('本地播放列表包含无效的视频分片地址');
+      }
+      const segmentPath = path.resolve(downloadDir, line);
+      if (path.dirname(segmentPath) !== path.resolve(downloadDir)) {
+        throw new Error('本地播放列表的视频分片路径无效');
+      }
+      if (!duration) throw new Error('本地播放列表缺少视频分片时长');
+      if (!fs.existsSync(segmentPath) || fs.statSync(segmentPath).size === 0) {
+        throw new Error(`视频分片缺失或为空：${line}`);
+      }
+
+      remuxLines.push(`#EXTINF:${duration},`);
+      remuxLines.push(line);
+      duration = '';
+      segmentCount++;
+    }
+
+    if (hasEncryptionKey && !fs.existsSync(path.join(downloadDir, 'key.key'))) {
+      throw new Error('本地 AES-128 密钥缺失，无法生成 MP4');
+    }
+    if (segmentCount === 0) throw new Error('本地播放列表没有可封装的视频分片');
+    if (duration) throw new Error('本地播放列表最后一个视频分片不完整');
+    remuxLines.push('#EXT-X-ENDLIST');
+    return remuxLines;
+  }
+
+  private getPublishedPath(playbackId: string): string {
+    if (!this.exportDir || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playbackId)) {
+      throw new Error('缓存链接标识无效');
+    }
+    const filePath = path.resolve(this.exportDir, `${playbackId}.mp4`);
+    if (path.dirname(filePath) !== this.exportDir) throw new Error('缓存链接路径无效');
+    return filePath;
+  }
+
+  private async runProcess(command: string, taskId: string, args: string[], signal?: AbortSignal): Promise<string> {
+    this.throwIfAborted(signal);
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    this.childProcesses.set(taskId, child);
+    let stdout = '';
+    let stderr = '';
+    const maxOutputLength = 32 * 1024;
+    child.stdout.on('data', (chunk: Buffer | string) => {
+      stdout = (stdout + chunk.toString()).slice(-maxOutputLength);
+    });
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      stderr = (stderr + chunk.toString()).slice(-maxOutputLength);
+    });
+
+    return new Promise<string>((resolve, reject) => {
+      let settled = false;
+      let killTimeout: NodeJS.Timeout | undefined;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        if (killTimeout) clearTimeout(killTimeout);
+        signal?.removeEventListener('abort', abortProcess);
+        this.childProcesses.delete(taskId);
+        if (error) reject(error);
+        else resolve(stdout);
+      };
+      const abortProcess = () => {
+        if (child.exitCode !== null || child.signalCode !== null) return;
+        child.kill('SIGTERM');
+        killTimeout = setTimeout(() => {
+          if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+        }, 5000);
+        killTimeout.unref();
+      };
+      child.once('error', (error) => finish(error));
+      child.once('close', (code, childSignal) => {
+        if (signal?.aborted) {
+          finish(new Error('任务已取消'));
+        } else if (code !== 0) {
+          const details = stderr.trim().slice(-4000);
+          finish(new Error(details || `${command} exited with ${childSignal || code}`));
+        } else {
+          finish();
+        }
+      });
+      signal?.addEventListener('abort', abortProcess, { once: true });
+      if (signal?.aborted) abortProcess();
+    });
+  }
+
+  private throwIfAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return;
+    const error = new Error('任务已取消');
+    error.name = 'AbortError';
+    throw error;
+  }
+
+  private formatError(error: unknown): string {
+    if (error instanceof Error) return error.message;
+    if (typeof error === 'string') return error;
+    return '未知错误';
+  }
+
+  getDownloadDirectory(source: string, videoId: string, episodeIndex: number): string {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/.test(source) || source === '.' || source === '..') {
+      throw new Error('视频源标识无效');
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/.test(videoId) || videoId === '.' || videoId === '..') {
+      throw new Error('视频标识无效');
+    }
+    if (!Number.isInteger(episodeIndex) || episodeIndex < 0 || episodeIndex > 9999) {
+      throw new Error('集数索引无效');
+    }
+    const baseDir = path.resolve(this.baseDir);
+    const downloadDir = path.resolve(baseDir, source, videoId, `ep${episodeIndex + 1}`);
+    if (!downloadDir.startsWith(baseDir + path.sep)) throw new Error('下载目录路径无效');
+    return downloadDir;
   }
 
   /**
@@ -624,8 +988,18 @@ export class OfflineDownloader {
    * 删除下载任务的所有文件
    */
   async deleteTask(task: OfflineDownloadTask): Promise<void> {
-    if (fs.existsSync(task.downloadDir)) {
-      fs.rmSync(task.downloadDir, { recursive: true, force: true });
+    const expectedDownloadDir = this.getDownloadDirectory(task.source, task.videoId, task.episodeIndex);
+    if (path.resolve(task.downloadDir) !== expectedDownloadDir) throw new Error('下载目录路径与任务不匹配，拒绝删除');
+    await fs.promises.rm(expectedDownloadDir, { recursive: true, force: true });
+    if (this.exportDir && task.playbackId) {
+      if (fs.existsSync(this.exportDir)) {
+        await fs.promises.rm(this.getPublishedPath(task.playbackId), { force: true });
+        for (const entry of await fs.promises.readdir(this.exportDir, { withFileTypes: true })) {
+          if (entry.isFile() && entry.name.startsWith(`.${task.playbackId}.`) && entry.name.endsWith('.part.mp4')) {
+            await fs.promises.rm(path.join(this.exportDir, entry.name), { force: true });
+          }
+        }
+      }
     }
   }
 
@@ -633,7 +1007,7 @@ export class OfflineDownloader {
    * 检查视频是否已下载
    */
   checkDownloaded(source: string, videoId: string, episodeIndex: number): boolean {
-    const downloadDir = path.join(this.baseDir, source, videoId, `ep${episodeIndex + 1}`);
+    const downloadDir = this.getDownloadDirectory(source, videoId, episodeIndex);
     const playlistPath = path.join(downloadDir, 'playlist.m3u8');
     return fs.existsSync(playlistPath);
   }
@@ -642,7 +1016,7 @@ export class OfflineDownloader {
    * 获取本地播放列表路径
    */
   getLocalPlaylistPath(source: string, videoId: string, episodeIndex: number): string | null {
-    const downloadDir = path.join(this.baseDir, source, videoId, `ep${episodeIndex + 1}`);
+    const downloadDir = this.getDownloadDirectory(source, videoId, episodeIndex);
     const playlistPath = path.join(downloadDir, 'playlist.m3u8');
     return fs.existsSync(playlistPath) ? playlistPath : null;
   }

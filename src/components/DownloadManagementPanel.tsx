@@ -4,15 +4,17 @@ import { Check, ChevronDown, Download, Trash2, X } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
 
-import { downloadDB, CompletedTask } from '@/lib/download-db';
+import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
+import { CompletedTask,downloadDB } from '@/lib/download-db';
 import {
   buildIndexedDBVideoCacheKey,
+  deleteIndexedDBVideoCacheByEpisode,
   getIndexedDBVideoManifestByEpisode,
   getIndexedDBVideoSegments,
-  deleteIndexedDBVideoCacheByEpisode,
 } from '@/lib/indexeddb-video-cache';
 
 import { ConfirmDialog } from './ConfirmDialog';
+import { OfflineDownloadPanel } from './OfflineDownloadPanel';
 
 interface DownloadManagementPanelProps {
   isOpen: boolean;
@@ -43,10 +45,22 @@ export function DownloadManagementPanel({
   const [isExporting, setIsExporting] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [showConfirmDialog, setShowConfirmDialog] = useState(false);
+  const [activeTab, setActiveTab] = useState<'browser' | 'server'>('browser');
+  const [canViewServerDownloads, setCanViewServerDownloads] = useState(false);
 
   useEffect(() => {
     setMounted(true);
+    const role = getAuthInfoFromBrowserCookie()?.role;
+    const enabled =
+      (window as any).RUNTIME_CONFIG?.ENABLE_OFFLINE_DOWNLOAD === true;
+    setCanViewServerDownloads(
+      enabled && (role === 'owner' || role === 'admin')
+    );
   }, []);
+
+  useEffect(() => {
+    if (!canViewServerDownloads) setActiveTab('browser');
+  }, [canViewServerDownloads]);
 
   useEffect(() => {
     if (isOpen) {
@@ -567,6 +581,43 @@ export function DownloadManagementPanel({
               </button>
             </div>
 
+            {canViewServerDownloads ? (
+              <div
+                className='flex gap-2 border-b border-gray-200 px-3 py-2 dark:border-gray-700 sm:px-4'
+                role='tablist'
+                aria-label='下载来源'
+              >
+                <button
+                  type='button'
+                  role='tab'
+                  aria-selected={activeTab === 'browser'}
+                  onClick={() => setActiveTab('browser')}
+                  className={`rounded px-3 py-2 text-sm font-medium transition-colors ${
+                    activeTab === 'browser'
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
+                  }`}
+                >
+                  浏览器下载
+                </button>
+                <button
+                  type='button'
+                  role='tab'
+                  aria-selected={activeTab === 'server'}
+                  onClick={() => setActiveTab('server')}
+                  className={`rounded px-3 py-2 text-sm font-medium transition-colors ${
+                    activeTab === 'server'
+                      ? 'bg-blue-500 text-white'
+                      : 'bg-gray-100 text-gray-700 hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700'
+                  }`}
+                >
+                  服务端缓存
+                </button>
+              </div>
+            ) : null}
+
+            {activeTab === 'browser' ? (
+              <>
             {/* Toolbar */}
             <div className='flex items-center justify-between gap-3 border-b border-gray-200 p-3 dark:border-gray-700 sm:p-4'>
               <div className='min-w-0 flex-1 flex-col gap-2 sm:flex sm:flex-row sm:items-center sm:gap-4'>
@@ -777,6 +828,16 @@ export function DownloadManagementPanel({
                 </div>
               )}
             </div>
+              </>
+            ) : (
+              <div className='min-h-0 flex-1 overflow-hidden'>
+                <OfflineDownloadPanel
+                  isOpen={isOpen && activeTab === 'server'}
+                  onClose={() => setActiveTab('browser')}
+                  embedded
+                />
+              </div>
+            )}
           </div>
         </div>,
         document.body

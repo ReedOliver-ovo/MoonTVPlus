@@ -38,7 +38,9 @@ FROM node:24-alpine AS runner
 RUN corepack enable && corepack prepare pnpm@latest --activate
 
 # 安装 su-exec，用于在 entrypoint 中降权运行
-RUN apk add --no-cache su-exec
+RUN apk add --no-cache su-exec ffmpeg \
+  && ffmpeg -version >/dev/null \
+  && ffprobe -version >/dev/null
 
 # 创建非 root 用户
 RUN addgroup -g 1001 -S nodejs && adduser -u 1001 -S nextjs -G nodejs
@@ -54,6 +56,7 @@ ENV PORT=3000
 ENV DOCKER_ENV=true
 ENV SQLITE_DB_PATH=/app/.data/moontv.db
 ENV OFFLINE_DOWNLOAD_DIR=/data
+ENV OFFLINE_DOWNLOAD_EXPORT_DIR=/media
 
 # 从构建器中复制 standalone 输出
 COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
@@ -76,9 +79,9 @@ COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 # 从构建器中复制生产依赖（包含 Socket.IO / better-sqlite3）
 COPY --from=builder --chown=nextjs:nodejs /tmp/prod-deps/node_modules ./node_modules
 
-# 准备 SQLite 数据目录和默认离线下载目录
-RUN mkdir -p /app/.data "$OFFLINE_DOWNLOAD_DIR" \
-  && chown -R nextjs:nodejs /app/.data "$OFFLINE_DOWNLOAD_DIR"
+# 准备 SQLite、分片下载和 MP4 导出目录
+RUN mkdir -p /app/.data "$OFFLINE_DOWNLOAD_DIR" "$OFFLINE_DOWNLOAD_EXPORT_DIR" \
+  && chown -R nextjs:nodejs /app/.data "$OFFLINE_DOWNLOAD_DIR" "$OFFLINE_DOWNLOAD_EXPORT_DIR"
 
 # 默认以 root 启动，由 entrypoint 按 PUID/PGID 环境变量调整后降权运行
 EXPOSE 3000

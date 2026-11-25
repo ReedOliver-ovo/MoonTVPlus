@@ -1,7 +1,9 @@
 /**
  * 离线下载任务管理 API
  */
+/* eslint-disable no-console */
 
+import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import { NextRequest, NextResponse } from 'next/server';
 import * as path from 'path';
@@ -9,155 +11,273 @@ import * as path from 'path';
 import { getAuthInfoFromCookie } from '@/lib/auth';
 import { OfflineDownloader, OfflineDownloadTask } from '@/lib/offline-downloader';
 
-// 检查是否启用离线下载功能
-const OFFLINE_DOWNLOAD_ENABLED = process.env.NEXT_PUBLIC_ENABLE_OFFLINE_DOWNLOAD === 'true';
+const OFFLINE_DOWNLOAD_ENABLED =
+  process.env.NEXT_PUBLIC_ENABLE_OFFLINE_DOWNLOAD === 'true';
 const OFFLINE_DOWNLOAD_DIR = process.env.OFFLINE_DOWNLOAD_DIR || '/data';
 const OFFLINE_DOWNLOAD_PROXY = process.env.OFFLINE_DOWNLOAD_PROXY || '';
+const OFFLINE_DOWNLOAD_EXPORT_DIR =
+  process.env.OFFLINE_DOWNLOAD_EXPORT_DIR?.trim() || undefined;
+const PLAYBACK_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
-// 全局下载器实例
 let downloader: OfflineDownloader | null = null;
-
-// 任务存储（内存中）
 const tasks = new Map<string, OfflineDownloadTask>();
-
-// 活跃的下载Promise
 const activeDownloads = new Map<string, Promise<void>>();
-
-// 任务持久化文件路径
+const cancellationControllers = new Map<string, AbortController>();
+const deletingTasks = new Set<string>();
 const TASKS_FILE = path.join(OFFLINE_DOWNLOAD_DIR, 'tasks.json');
+let queueRunner: Promise<void> | null = null;
 
-/**
- * 保存任务到文件
- */
 function saveTasks(): void {
+  const temporaryPath = `${TASKS_FILE}.${randomUUID()}.tmp`;
   try {
-    const tasksArray = Array.from(tasks.values()).map((task) => ({
+    const taskData = Array.from(tasks.values()).map((task) => ({
       ...task,
       createdAt: task.createdAt.toISOString(),
       updatedAt: task.updatedAt.toISOString(),
     }));
-
-    // 确保目录存在
-    const dir = path.dirname(TASKS_FILE);
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    fs.writeFileSync(TASKS_FILE, JSON.stringify(tasksArray, null, 2), 'utf-8');
+    fs.mkdirSync(path.dirname(TASKS_FILE), { recursive: true });
+    fs.writeFileSync(temporaryPath, JSON.stringify(taskData, null, 2), 'utf-8');
+    fs.renameSync(temporaryPath, TASKS_FILE);
   } catch (error) {
-    console.error('保存任务失败:', error);
+    try {
+      fs.rmSync(temporaryPath, { force: true });
+    } catch {
+      // Leave the persistence error as the reported failure.
+    }
+    throw error;
   }
 }
 
-/**
- * 从文件加载任务
- */
 function loadTasks(): void {
+  if (!fs.existsSync(TASKS_FILE)) return;
+
   try {
-    console.log('尝试加载任务文件:', TASKS_FILE);
+    const storedTasks = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'));
+    if (!Array.isArray(storedTasks)) throw new Error('任务文件格式无效');
 
-    if (!fs.existsSync(TASKS_FILE)) {
-      console.log('任务文件不存在:', TASKS_FILE);
-      return;
-    }
+    for (const taskData of storedTasks) {
+      const episodeIndex = Number(taskData.episodeIndex);
+      if (
+        typeof taskData.id !== 'string' ||
+        !taskData.id ||
+        typeof taskData.source !== 'string' ||
+        typeof taskData.videoId !== 'string' ||
+        !Number.isInteger(episodeIndex) ||
+        episodeIndex < 0
+      ) {
+        continue;
+      }
 
-    const content = fs.readFileSync(TASKS_FILE, 'utf-8');
-    const tasksArray = JSON.parse(content);
-    console.log(`从文件读取到 ${tasksArray.length} 个任务`);
+      let downloadDir: string;
+      try {
+        downloadDir = getDownloader().getDownloadDirectory(
+          taskData.source,
+          taskData.videoId,
+          episodeIndex
+        );
+      } catch {
+        continue;
+      }
 
-    for (const taskData of tasksArray) {
       const task: OfflineDownloadTask = {
         ...taskData,
+        episodeIndex,
+        downloadDir,
         createdAt: new Date(taskData.createdAt),
         updatedAt: new Date(taskData.updatedAt),
+        playbackId:
+          typeof taskData.playbackId === 'string' &&
+          PLAYBACK_ID_PATTERN.test(taskData.playbackId)
+            ? taskData.playbackId
+            : undefined,
       };
 
-      // 如果任务在下载或等待中，说明服务器重启了，将状态改为暂停
       if (task.status === 'downloading' || task.status === 'pending') {
         task.status = 'paused';
         task.errorMessage = '服务器重启，任务已暂停';
+      } else if (task.status === 'remuxing') {
+        if (getDownloader().getPlaybackUrl(task)) {
+          task.status = 'completed';
+          task.errorMessage = undefined;
+        } else {
+          task.status = 'paused';
+          task.errorMessage = '服务器重启，MP4 封装已暂停，请重试';
+        }
       }
 
       tasks.set(task.id, task);
     }
-
-    console.log(`已加载 ${tasks.size} 个离线下载任务到内存`);
   } catch (error) {
-    console.error('加载任务失败:', error);
+    console.error('加载离线下载任务失败:', error);
   }
 }
 
 function getDownloader(): OfflineDownloader {
   if (!downloader) {
-    downloader = new OfflineDownloader(OFFLINE_DOWNLOAD_DIR, OFFLINE_DOWNLOAD_PROXY);
-    // 首次初始化时加载已保存的任务
+    downloader = new OfflineDownloader(
+      OFFLINE_DOWNLOAD_DIR,
+      OFFLINE_DOWNLOAD_PROXY,
+      OFFLINE_DOWNLOAD_EXPORT_DIR
+    );
     loadTasks();
   }
-
   return downloader;
 }
 
-/**
- * 检查用户权限（仅管理员和站长）
- */
 function checkPermission(request: NextRequest): boolean {
-  if (!OFFLINE_DOWNLOAD_ENABLED) {
-    return false;
-  }
-
+  if (!OFFLINE_DOWNLOAD_ENABLED) return false;
   const authInfo = getAuthInfoFromCookie(request);
-  if (!authInfo || !authInfo.username) {
-    return false;
-  }
-
-  // 只有管理员和站长可以使用
-  return authInfo.role === 'owner' || authInfo.role === 'admin';
+  return Boolean(
+    authInfo?.username &&
+      (authInfo.role === 'owner' || authInfo.role === 'admin')
+  );
 }
 
-/**
- * GET - 获取任务列表或检查下载状态
- */
+function serializeTask(task: OfflineDownloadTask) {
+  const { playbackId: _playbackId, ...publicTask } = task;
+  const playbackUrl = getDownloader().getPlaybackUrl(task);
+  return {
+    ...publicTask,
+    ...(playbackUrl ? { playbackUrl } : {}),
+    createdAt: task.createdAt.toISOString(),
+    updatedAt: task.updatedAt.toISOString(),
+  };
+}
+
+function getNextQueuedTask(): OfflineDownloadTask | undefined {
+  return Array.from(tasks.values())
+    .filter(
+      (task) => task.status === 'pending' && !deletingTasks.has(task.id)
+    )
+    .sort(
+      (a, b) =>
+        a.createdAt.getTime() - b.createdAt.getTime() ||
+        a.id.localeCompare(b.id)
+    )[0];
+}
+
+function updateTask(task: OfflineDownloadTask): void {
+  if (deletingTasks.has(task.id)) return;
+  tasks.set(task.id, task);
+  saveTasks();
+}
+
+async function processTask(
+  task: OfflineDownloadTask,
+  signal: AbortSignal
+): Promise<void> {
+  const taskDownloader = getDownloader();
+  const exportToMp4 = Boolean(OFFLINE_DOWNLOAD_EXPORT_DIR);
+
+  try {
+    if (exportToMp4) taskDownloader.getOrCreatePlaybackId(task);
+    await taskDownloader.startDownload(
+      task,
+      updateTask,
+      signal,
+      exportToMp4
+    );
+    if (signal.aborted || deletingTasks.has(task.id)) return;
+
+    if (exportToMp4) {
+      task.status = 'remuxing';
+      task.errorMessage = undefined;
+      task.updatedAt = new Date();
+      updateTask(task);
+      await taskDownloader.remuxToMp4(task, signal);
+      if (signal.aborted || deletingTasks.has(task.id)) return;
+    }
+
+    task.status = 'completed';
+    task.progress = 100;
+    task.errorMessage = undefined;
+    task.updatedAt = new Date();
+    updateTask(task);
+  } catch (error) {
+    if (signal.aborted || deletingTasks.has(task.id)) return;
+    task.status = 'error';
+    task.errorMessage =
+      error instanceof Error ? error.message : '离线下载或 MP4 封装失败';
+    task.updatedAt = new Date();
+    tasks.set(task.id, task);
+    try {
+      saveTasks();
+    } catch (saveError) {
+      console.error('保存缓存任务错误状态失败:', saveError);
+    }
+    console.error('服务器离线缓存任务失败:', error);
+  }
+}
+
+function scheduleQueuedTasks(): void {
+  if (queueRunner) return;
+
+  queueRunner = Promise.resolve()
+    .then(async () => {
+      let nextTask = getNextQueuedTask();
+      while (nextTask) {
+        const controller = new AbortController();
+        cancellationControllers.set(nextTask.id, controller);
+        const work = processTask(nextTask, controller.signal);
+        activeDownloads.set(nextTask.id, work);
+
+        try {
+          await work;
+        } finally {
+          activeDownloads.delete(nextTask.id);
+          cancellationControllers.delete(nextTask.id);
+        }
+        nextTask = getNextQueuedTask();
+      }
+    })
+    .catch((error) => {
+      console.error('离线下载队列异常:', error);
+    })
+    .finally(() => {
+      queueRunner = null;
+      if (
+        Array.from(tasks.values()).some((task) => task.status === 'pending')
+      ) {
+        scheduleQueuedTasks();
+      }
+    });
+}
+
 export async function GET(request: NextRequest) {
   if (!checkPermission(request)) {
     return NextResponse.json({ error: '无权限' }, { status: 403 });
   }
 
-  // 确保下载器已初始化（这会触发任务加载）
   getDownloader();
-
   const { searchParams } = new URL(request.url);
-  const action = searchParams.get('action');
-
-  // 检查视频是否已下载
-  if (action === 'check') {
+  if (searchParams.get('action') === 'check') {
     const source = searchParams.get('source');
     const videoId = searchParams.get('videoId');
-    const episodeIndex = searchParams.get('episodeIndex');
-
-    if (!source || !videoId || episodeIndex === null) {
+    const episodeIndexValue = searchParams.get('episodeIndex');
+    const episodeIndex = Number(episodeIndexValue);
+    if (!source || !videoId || episodeIndexValue === null || !Number.isInteger(episodeIndex)) {
       return NextResponse.json({ error: '参数不完整' }, { status: 400 });
     }
-
-    const downloader = getDownloader();
-    const downloaded = downloader.checkDownloaded(source, videoId, parseInt(episodeIndex));
-
-    return NextResponse.json({ downloaded });
+    try {
+      return NextResponse.json({
+        downloaded: getDownloader().checkDownloaded(
+          source,
+          videoId,
+          episodeIndex
+        ),
+      });
+    } catch (error) {
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : '参数无效' },
+        { status: 400 }
+      );
+    }
   }
 
-  // 获取所有任务列表
-  const taskList = Array.from(tasks.values()).map((task) => ({
-    ...task,
-    // 转换 Date 对象为 ISO 字符串
-    createdAt: task.createdAt.toISOString(),
-    updatedAt: task.updatedAt.toISOString(),
-  }));
-
-  return NextResponse.json({ tasks: taskList });
+  return NextResponse.json({ tasks: Array.from(tasks.values()).map(serializeTask) });
 }
 
-/**
- * POST - 创建离线下载任务
- */
 export async function POST(request: NextRequest) {
   if (!checkPermission(request)) {
     return NextResponse.json({ error: '无权限' }, { status: 403 });
@@ -166,181 +286,209 @@ export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
     const { source, videoId, episodeIndex, title, m3u8Url, metadata } = body;
-
-    if (!source || !videoId || episodeIndex === undefined || !title || !m3u8Url) {
+    if (
+      !source ||
+      !videoId ||
+      !Number.isInteger(episodeIndex) ||
+      !title ||
+      typeof m3u8Url !== 'string'
+    ) {
       return NextResponse.json({ error: '参数不完整' }, { status: 400 });
     }
 
-    const downloader = getDownloader();
-
-    // 1. 首先检查是否已经有相同的任务（任何状态）
-    const existingTask = Array.from(tasks.values()).find(
-      (t) =>
-        t.source === source &&
-        t.videoId === videoId &&
-        t.episodeIndex === episodeIndex
-    );
-
-    if (existingTask) {
-      // 如果任务正在下载或等待中，不允许重复创建
-      if (existingTask.status === 'downloading' || existingTask.status === 'pending') {
-        return NextResponse.json(
-          {
-            task: {
-              ...existingTask,
-              createdAt: existingTask.createdAt.toISOString(),
-              updatedAt: existingTask.updatedAt.toISOString(),
-            },
-            message: '该任务正在下载中，请勿重复添加',
-          },
-          { status: 400 }
-        );
-      }
-
-      // 如果任务已完成，不允许重复创建
-      if (existingTask.status === 'completed') {
-        return NextResponse.json(
-          {
-            task: {
-              ...existingTask,
-              createdAt: existingTask.createdAt.toISOString(),
-              updatedAt: existingTask.updatedAt.toISOString(),
-            },
-            message: '该视频已下载完成，如需重新下载请先删除任务',
-          },
-          { status: 400 }
-        );
-      }
-
-      // 如果任务处于错误或暂停状态，提示用户使用重试功能
-      if (existingTask.status === 'error' || existingTask.status === 'paused') {
-        return NextResponse.json(
-          {
-            task: {
-              ...existingTask,
-              createdAt: existingTask.createdAt.toISOString(),
-              updatedAt: existingTask.updatedAt.toISOString(),
-            },
-            message: '该任务已存在但未完成，请使用重试功能继续下载',
-          },
-          { status: 400 }
-        );
-      }
-    }
-
-    // 2. 检查文件系统中是否已下载完成（防止任务被删除但文件还在的情况）
-    const downloaded = downloader.checkDownloaded(source, videoId, episodeIndex);
-    if (downloaded) {
+    const taskDownloader = getDownloader();
+    try {
+      taskDownloader.getDownloadDirectory(
+        source,
+        videoId,
+        episodeIndex
+      );
+    } catch (error) {
       return NextResponse.json(
-        {
-          message: '该视频文件已存在，无需重复下载',
-          downloaded: true,
-        },
+        { error: error instanceof Error ? error.message : '参数无效' },
         { status: 400 }
       );
     }
 
-    // 创建新任务
-    const task = await downloader.createTask(source, videoId, episodeIndex, title, m3u8Url, metadata);
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(m3u8Url);
+    } catch {
+      return NextResponse.json({ error: '播放列表地址无效' }, { status: 400 });
+    }
+    if (
+      (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') ||
+      parsedUrl.href.length > 8192
+    ) {
+      return NextResponse.json({ error: '仅支持 HTTP 或 HTTPS 播放地址' }, { status: 400 });
+    }
+
+    const existingTask = Array.from(tasks.values()).find(
+      (task) =>
+        task.source === source &&
+        task.videoId === videoId &&
+        task.episodeIndex === episodeIndex
+    );
+    if (existingTask && deletingTasks.has(existingTask.id)) {
+      return NextResponse.json({ error: '该缓存任务正在删除，请稍后重试' }, { status: 409 });
+    }
+
+    if (
+      existingTask?.status === 'pending' ||
+      existingTask?.status === 'downloading' ||
+      existingTask?.status === 'remuxing'
+    ) {
+      return NextResponse.json(
+        { task: serializeTask(existingTask), message: '该视频已在缓存队列中' },
+        { status: 202 }
+      );
+    }
+
+    if (existingTask?.status === 'completed') {
+      if (taskDownloader.getPlaybackUrl(existingTask)) {
+        return NextResponse.json(
+          { task: serializeTask(existingTask), message: '该视频已缓存，可复制现有播放链接' },
+          { status: 409 }
+        );
+      }
+      const previousStatus = existingTask.status;
+      const previousErrorMessage = existingTask.errorMessage;
+      const previousUpdatedAt = existingTask.updatedAt;
+      existingTask.status = 'pending';
+      existingTask.errorMessage = undefined;
+      existingTask.updatedAt = new Date();
+      tasks.set(existingTask.id, existingTask);
+      try {
+        saveTasks();
+      } catch (error) {
+        existingTask.status = previousStatus;
+        existingTask.errorMessage = previousErrorMessage;
+        existingTask.updatedAt = previousUpdatedAt;
+        return NextResponse.json(
+          { error: error instanceof Error ? error.message : '任务状态保存失败' },
+          { status: 507 }
+        );
+      }
+      scheduleQueuedTasks();
+      return NextResponse.json(
+        { task: serializeTask(existingTask), message: '已加入服务器缓存队列' },
+        { status: 202 }
+      );
+    }
+
+    if (existingTask) {
+      return NextResponse.json(
+        { task: serializeTask(existingTask), message: '该任务未完成，请在下载管理中重试' },
+        { status: 409 }
+      );
+    }
+
+    if (taskDownloader.checkDownloaded(source, videoId, episodeIndex)) {
+      return NextResponse.json(
+        { error: '该视频 HLS 分片已存在，但没有任务记录。请通过下载管理恢复该任务' },
+        { status: 409 }
+      );
+    }
+
+    const safeMetadata = metadata && typeof metadata === 'object' ? metadata : undefined;
+    const task = taskDownloader.createTask(
+      source,
+      videoId,
+      episodeIndex,
+      String(title).slice(0, 240),
+      parsedUrl.href,
+      safeMetadata
+    );
+    task.status = 'pending';
     tasks.set(task.id, task);
-    saveTasks(); // 持久化任务
+    try {
+      saveTasks();
+    } catch (error) {
+      tasks.delete(task.id);
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : '任务状态保存失败' },
+        { status: 507 }
+      );
+    }
+    scheduleQueuedTasks();
 
-    // 开始下载（异步）
-    const downloadPromise = downloader
-      .startDownload(task, (updatedTask) => {
-        // 更新任务状态
-        tasks.set(updatedTask.id, updatedTask);
-        saveTasks(); // 持久化任务
-      })
-      .catch((error) => {
-        console.error('下载失败:', error);
-        task.status = 'error';
-        task.errorMessage = error.message;
-        tasks.set(task.id, task);
-        saveTasks(); // 持久化任务
-      })
-      .finally(() => {
-        // 下载完成后，从活跃下载列表中移除
-        activeDownloads.delete(task.id);
-      });
-
-    activeDownloads.set(task.id, downloadPromise);
-
-    return NextResponse.json({
-      task: {
-        ...task,
-        createdAt: task.createdAt.toISOString(),
-        updatedAt: task.updatedAt.toISOString(),
-      },
-      message: '任务已创建',
-    });
-  } catch (error) {
-    console.error('创建任务失败:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : '创建任务失败' },
+      { task: serializeTask(task), message: '已加入服务器缓存队列' },
+      { status: 202 }
+    );
+  } catch (error) {
+    console.error('创建服务器缓存任务失败:', error);
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : '创建服务器缓存任务失败' },
       { status: 500 }
     );
   }
 }
 
-/**
- * DELETE - 删除任务
- */
 export async function DELETE(request: NextRequest) {
   if (!checkPermission(request)) {
     return NextResponse.json({ error: '无权限' }, { status: 403 });
   }
 
+  const { searchParams } = new URL(request.url);
+  const taskId = searchParams.get('taskId');
+  if (!taskId) {
+    return NextResponse.json({ error: '缺少任务ID' }, { status: 400 });
+  }
+  if (deletingTasks.has(taskId)) {
+    return NextResponse.json({ error: '该任务正在删除' }, { status: 409 });
+  }
+  const task = tasks.get(taskId);
+  if (!task) {
+    return NextResponse.json({ error: '任务不存在' }, { status: 404 });
+  }
+
+  deletingTasks.add(taskId);
   try {
-    const { searchParams } = new URL(request.url);
-    const taskId = searchParams.get('taskId');
+    cancellationControllers.get(taskId)?.abort();
+    getDownloader().requestCancel(taskId);
+    const activeWork = activeDownloads.get(taskId);
+    if (activeWork) await activeWork;
 
-    if (!taskId) {
-      return NextResponse.json({ error: '缺少任务ID' }, { status: 400 });
-    }
-
-    const task = tasks.get(taskId);
-    if (!task) {
-      return NextResponse.json({ error: '任务不存在' }, { status: 404 });
-    }
-
-    const downloader = getDownloader();
-
-    // 如果任务正在下载，先标记为取消状态，等待下载停止
-    const downloadPromise = activeDownloads.get(taskId);
-    if (downloadPromise) {
-      // 将任务状态设置为 error，这样下载器会停止下载
-      task.status = 'error';
-      task.errorMessage = '任务已被删除';
-      tasks.set(taskId, task);
-
-      // 从活跃下载列表中移除
-      activeDownloads.delete(taskId);
-
-      // 等待一小段时间，让下载操作有机会停止
-      await new Promise(resolve => setTimeout(resolve, 500));
-    }
-
-    // 删除文件
-    await downloader.deleteTask(task);
-
-    // 从任务列表中移除
+    await getDownloader().deleteTask(task);
     tasks.delete(taskId);
-    saveTasks(); // 持久化任务
-
-    return NextResponse.json({ message: '任务已删除' });
+    try {
+      saveTasks();
+    } catch (error) {
+      task.status = 'error';
+      task.errorMessage = '视频文件已删除，但任务记录保存失败。请刷新下载管理后重试清理任务';
+      task.updatedAt = new Date();
+      tasks.set(taskId, task);
+      try {
+        saveTasks();
+      } catch (recoveryError) {
+        console.error('恢复已删除任务记录失败:', recoveryError);
+      }
+      throw error;
+    }
+    return NextResponse.json({ message: '服务器缓存及任务记录已删除' });
   } catch (error) {
-    console.error('删除任务失败:', error);
+    task.status = 'error';
+    task.errorMessage = `删除缓存失败：${
+      error instanceof Error ? error.message : '未知错误'
+    }`;
+    task.updatedAt = new Date();
+    tasks.set(taskId, task);
+    try {
+      saveTasks();
+    } catch (saveError) {
+      console.error('保存删除错误状态失败:', saveError);
+    }
+    console.error('删除服务器缓存失败:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : '删除任务失败' },
+      { error: task.errorMessage },
       { status: 500 }
     );
+  } finally {
+    deletingTasks.delete(taskId);
   }
 }
 
-/**
- * PUT - 重试任务
- */
 export async function PUT(request: NextRequest) {
   if (!checkPermission(request)) {
     return NextResponse.json({ error: '无权限' }, { status: 403 });
@@ -349,74 +497,64 @@ export async function PUT(request: NextRequest) {
   try {
     const { searchParams } = new URL(request.url);
     const taskId = searchParams.get('taskId');
-    const action = searchParams.get('action');
-
     if (!taskId) {
       return NextResponse.json({ error: '缺少任务ID' }, { status: 400 });
     }
-
-    if (action !== 'retry') {
+    if (searchParams.get('action') !== 'retry') {
       return NextResponse.json({ error: '无效的操作' }, { status: 400 });
+    }
+    if (deletingTasks.has(taskId)) {
+      return NextResponse.json({ error: '该任务正在删除' }, { status: 409 });
     }
 
     const task = tasks.get(taskId);
     if (!task) {
       return NextResponse.json({ error: '任务不存在' }, { status: 404 });
     }
-
-    // 检查任务状态，只有错误、暂停或完成状态可以重试
-    if (task.status === 'downloading' || task.status === 'pending') {
-      return NextResponse.json({ error: '任务正在进行中，无法重试' }, { status: 400 });
+    if (
+      task.status === 'pending' ||
+      task.status === 'downloading' ||
+      task.status === 'remuxing' ||
+      activeDownloads.has(taskId)
+    ) {
+      return NextResponse.json({ error: '任务正在进行中，无法重试' }, { status: 409 });
+    }
+    if (getDownloader().getPlaybackUrl(task)) {
+      return NextResponse.json({
+        error: '该任务已生成播放链接，无需重试',
+        task: serializeTask(task),
+      }, { status: 409 });
     }
 
-    // 检查是否已经在重试中
-    if (activeDownloads.has(taskId)) {
-      return NextResponse.json({ error: '任务已在重试中' }, { status: 400 });
-    }
-
-    const downloader = getDownloader();
-
-    // 重置任务状态（保留已下载的进度，只重试失败的片段）
+    const previousStatus = task.status;
+    const previousErrorMessage = task.errorMessage;
+    const previousUpdatedAt = task.updatedAt;
     task.status = 'pending';
-    // 不重置 progress 和 downloadedSegments，让下载器自动跳过已下载的片段
     task.errorMessage = undefined;
     task.updatedAt = new Date();
     tasks.set(taskId, task);
-    saveTasks(); // 持久化任务
+    try {
+      saveTasks();
+    } catch (error) {
+      task.status = previousStatus;
+      task.errorMessage = previousErrorMessage;
+      task.updatedAt = previousUpdatedAt;
+      tasks.set(taskId, task);
+      return NextResponse.json(
+        { error: error instanceof Error ? error.message : '任务状态保存失败' },
+        { status: 507 }
+      );
+    }
+    scheduleQueuedTasks();
 
-    // 开始重新下载（异步）
-    const downloadPromise = downloader
-      .startDownload(task, (updatedTask) => {
-        // 更新任务状态
-        tasks.set(updatedTask.id, updatedTask);
-        saveTasks(); // 持久化任务
-      })
-      .catch((error) => {
-        console.error('重试下载失败:', error);
-        task.status = 'error';
-        task.errorMessage = error.message;
-        tasks.set(task.id, task);
-        saveTasks(); // 持久化任务
-      })
-      .finally(() => {
-        // 下载完成后，从活跃下载列表中移除
-        activeDownloads.delete(task.id);
-      });
-
-    activeDownloads.set(task.id, downloadPromise);
-
-    return NextResponse.json({
-      task: {
-        ...task,
-        createdAt: task.createdAt.toISOString(),
-        updatedAt: task.updatedAt.toISOString(),
-      },
-      message: '任务已重新开始',
-    });
-  } catch (error) {
-    console.error('重试任务失败:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : '重试任务失败' },
+      { task: serializeTask(task), message: '已重新加入服务器缓存队列' },
+      { status: 202 }
+    );
+  } catch (error) {
+    console.error('重试服务器缓存任务失败:', error);
+    return NextResponse.json(
+      { error: error instanceof Error ? error.message : '重试服务器缓存任务失败' },
       { status: 500 }
     );
   }

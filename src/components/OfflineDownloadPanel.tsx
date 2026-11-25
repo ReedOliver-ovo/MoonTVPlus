@@ -1,5 +1,6 @@
 'use client';
 
+import { Check, Copy, ExternalLink, X } from 'lucide-react';
 import React, { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
 
@@ -10,7 +11,13 @@ interface OfflineDownloadTask {
   episodeIndex: number;
   title: string;
   m3u8Url: string;
-  status: 'pending' | 'downloading' | 'completed' | 'error' | 'paused';
+  status:
+    | 'pending'
+    | 'downloading'
+    | 'remuxing'
+    | 'completed'
+    | 'error'
+    | 'paused';
   progress: number;
   totalSegments: number;
   downloadedSegments: number;
@@ -18,6 +25,7 @@ interface OfflineDownloadTask {
   createdAt: string;
   updatedAt: string;
   downloadDir: string;
+  playbackUrl?: string;
   metadata?: {
     videoTitle?: string;
     cover?: string;
@@ -31,13 +39,20 @@ interface OfflineDownloadTask {
 interface OfflineDownloadPanelProps {
   isOpen: boolean;
   onClose: () => void;
+  embedded?: boolean;
 }
 
-export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelProps) {
+export function OfflineDownloadPanel({
+  isOpen,
+  onClose,
+  embedded = false,
+}: OfflineDownloadPanelProps) {
   const [tasks, setTasks] = useState<OfflineDownloadTask[]>([]);
-  const [loading, setLoading] = useState(false);
   const [mounted, setMounted] = useState(false);
   const [viewMode, setViewMode] = useState<'tasks' | 'library'>('tasks'); // 视图模式：任务列表或视频库
+  const [deletingTaskId, setDeletingTaskId] = useState<string | null>(null);
+  const [copiedTaskId, setCopiedTaskId] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState('');
 
   // 确保只在客户端渲染
   useEffect(() => {
@@ -47,33 +62,61 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
   // 获取任务列表
   const fetchTasks = async () => {
     try {
-      const response = await fetch('/api/offline-download');
+      const response = await fetch('/api/offline-download', {
+        cache: 'no-store',
+      });
       if (response.ok) {
         const data = await response.json();
         setTasks(data.tasks || []);
+        setErrorMessage('');
+      } else {
+        setErrorMessage('读取服务器缓存任务失败');
       }
     } catch (error) {
       console.error('获取离线下载任务列表失败:', error);
+      setErrorMessage('读取服务器缓存任务失败，请检查网络后重试');
     }
   };
 
   // 删除任务
-  const handleDeleteTask = async (taskId: string) => {
+  const handleDeleteTask = async (
+    task: OfflineDownloadTask,
+    confirmed = false
+  ) => {
+    const videoTitle = task.metadata?.videoTitle || task.title;
+    if (
+      !confirmed &&
+      !window.confirm(
+        `确认删除服务器缓存吗？\n\n片名：${videoTitle}\n来源：${task.source}\n集数：第 ${task.episodeIndex + 1} 集\n\n将删除 VPS 上该集的缓存文件。`
+      )
+    ) {
+      return;
+    }
+
+    setDeletingTaskId(task.id);
+    setErrorMessage('');
     try {
-      const response = await fetch(`/api/offline-download?taskId=${taskId}`, {
-        method: 'DELETE',
-      });
+      const response = await fetch(
+        `/api/offline-download?taskId=${encodeURIComponent(task.id)}`,
+        { method: 'DELETE' }
+      );
 
       if (response.ok) {
-        // 从列表中移除
-        setTasks((prev) => prev.filter((t) => t.id !== taskId));
+        setTasks((previous) =>
+          previous.filter((item) => item.id !== task.id)
+        );
+        window.dispatchEvent(new Event('serverOfflineDownloadsUpdated'));
       } else {
-        const data = await response.json();
-        alert(`删除失败: ${data.error}`);
+        const data = await response.json().catch(() => ({}));
+        setErrorMessage(
+          data.error || `删除服务器缓存失败（${response.status}）`
+        );
       }
     } catch (error) {
       console.error('删除任务失败:', error);
-      alert('删除任务失败');
+      setErrorMessage('删除服务器缓存失败，请检查网络后重试');
+    } finally {
+      setDeletingTaskId(null);
     }
   };
 
@@ -85,7 +128,7 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
       });
 
       if (response.ok) {
-        const data = await response.json();
+        await response.json();
         // 更新任务状态（保留进度，只重试失败的片段）
         setTasks((prev) =>
           prev.map((t) =>
@@ -101,23 +144,41 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
         );
         // 立即刷新以获取最新状态
         fetchTasks();
+        window.dispatchEvent(new Event('serverOfflineDownloadsUpdated'));
       } else {
         const data = await response.json();
-        alert(`重试失败: ${data.error}`);
+        setErrorMessage(data.error || '重试服务器缓存失败');
       }
     } catch (error) {
       console.error('重试任务失败:', error);
-      alert('重试任务失败');
+      setErrorMessage('重试服务器缓存失败，请检查网络后重试');
     }
   };
 
   // 定期刷新任务列表
   useEffect(() => {
-    if (isOpen) {
-      fetchTasks();
-      const interval = setInterval(fetchTasks, 3000); // 每3秒刷新一次
-      return () => clearInterval(interval);
-    }
+    if (!isOpen) return;
+
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === 'visible') void fetchTasks();
+    };
+    const refreshForTaskUpdate = () => void fetchTasks();
+
+    refreshWhenVisible();
+    const interval = setInterval(refreshWhenVisible, 3000);
+    document.addEventListener('visibilitychange', refreshWhenVisible);
+    window.addEventListener(
+      'serverOfflineDownloadsUpdated',
+      refreshForTaskUpdate
+    );
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', refreshWhenVisible);
+      window.removeEventListener(
+        'serverOfflineDownloadsUpdated',
+        refreshForTaskUpdate
+      );
+    };
   }, [isOpen]);
 
   if (!isOpen || !mounted) {
@@ -130,6 +191,8 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
         return '等待中';
       case 'downloading':
         return '下载中';
+      case 'remuxing':
+        return '封装 MP4 中';
       case 'paused':
         return '已暂停';
       case 'completed':
@@ -158,10 +221,17 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
     }
   };
 
+  const getTaskStatusText = (task: OfflineDownloadTask) => {
+    if (task.status === 'completed') {
+      return task.playbackUrl ? '可播放' : '已下载，待生成 MP4';
+    }
+    return getStatusText(task.status);
+  };
+
   // 获取视频库中的视频（按videoId分组，包含已完成和有进度的任务）
   const getLibraryVideos = () => {
     // 筛选已完成或有下载进度的任务
-    const libraryTasks = tasks.filter((t) => t.status === 'completed' || t.progress > 0);
+    const libraryTasks = tasks;
     const videoMap = new Map<string, { video: OfflineDownloadTask; episodes: OfflineDownloadTask[] }>();
 
     libraryTasks.forEach((task) => {
@@ -181,10 +251,46 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
   };
 
   const libraryVideos = getLibraryVideos();
+  const getPlaybackUrl = (task: OfflineDownloadTask) =>
+    task.playbackUrl
+      ? new URL(task.playbackUrl, window.location.origin).href
+      : '';
+
+  const handleCopyPlaybackUrl = async (task: OfflineDownloadTask) => {
+    try {
+      await navigator.clipboard.writeText(getPlaybackUrl(task));
+      setCopiedTaskId(task.id);
+      window.setTimeout(() => setCopiedTaskId(null), 1800);
+    } catch {
+      setErrorMessage('复制播放网址失败，可在新标签页打开后复制地址栏');
+    }
+  };
 
   const panelContent = (
-    <div className='fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4'>
-      <div className='bg-white dark:bg-gray-800 rounded-lg shadow-2xl w-full max-w-4xl max-h-[80vh] flex flex-col'>
+    <div
+      className={
+        embedded
+          ? 'flex h-full min-h-0 w-full flex-col bg-white dark:bg-gray-900'
+          : 'fixed inset-0 z-[9999] flex items-center justify-center bg-black/50 backdrop-blur-sm p-4'
+      }
+      role={embedded ? undefined : 'dialog'}
+      aria-modal={embedded ? undefined : true}
+    >
+      {!embedded ? (
+        <button
+          type='button'
+          className='absolute inset-0 cursor-default'
+          aria-label='关闭服务器缓存管理'
+          onClick={onClose}
+        />
+      ) : null}
+      <div
+        className={
+          embedded
+            ? 'relative flex h-full min-h-0 w-full flex-col overflow-hidden border-t border-gray-200 dark:border-gray-700'
+            : 'relative flex max-h-[80vh] w-full max-w-4xl flex-col overflow-hidden rounded-lg bg-white shadow-2xl dark:bg-gray-800'
+        }
+      >
         {/* 标题栏 */}
         <div className='flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700'>
           <h2 className='text-xl font-bold text-gray-900 dark:text-white'>
@@ -218,21 +324,21 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
             <button
               onClick={onClose}
               className='text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200 transition-colors'
+              aria-label={embedded ? '返回浏览器下载记录' : '关闭服务器缓存管理'}
             >
-              <svg className='w-6 h-6' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
-                <path strokeLinecap='round' strokeLinejoin='round' strokeWidth='2' d='M6 18L18 6M6 6l12 12' />
-              </svg>
+              <X className='h-6 w-6' />
             </button>
           </div>
         </div>
 
         {/* 内容区域 */}
-        <div className='flex-1 overflow-y-auto p-4 space-y-3'>
-          {loading ? (
-            <div className='flex items-center justify-center h-full'>
-              <div className='animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500'></div>
-            </div>
-          ) : viewMode === 'library' ? (
+        {errorMessage ? (
+          <p className='border-b border-red-200 px-4 py-2 text-sm text-red-600 dark:border-red-800 dark:text-red-300' role='alert'>
+            {errorMessage}
+          </p>
+        ) : null}
+        <div className='min-h-0 flex-1 space-y-3 overflow-y-auto p-4'>
+          {viewMode === 'library' ? (
             // 视频库视图
             libraryVideos.length === 0 ? (
               <div className='flex flex-col items-center justify-center h-full text-gray-500 dark:text-gray-400'>
@@ -283,7 +389,7 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                       )}
                       <div className='flex items-center gap-2 mb-3'>
                         <span className='text-sm text-gray-600 dark:text-gray-400'>
-                          已下载 {episodes.length} 集
+                          {episodes.filter((episode) => episode.playbackUrl).length} 集可播放，{episodes.length} 项任务
                         </span>
                         {video.metadata?.totalEpisodes && (
                           <span className='text-sm text-gray-600 dark:text-gray-400'>
@@ -296,17 +402,48 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                         {episodes.map((ep) => (
                           <div
                             key={ep.id}
-                            className='flex items-center gap-1 px-2 py-1 bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 text-xs rounded group'
+                            className={`flex flex-wrap items-center gap-1 rounded px-2 py-1 text-xs group ${ep.status === 'completed' && ep.playbackUrl ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400' : 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300'}`}
                           >
                             <span>第{ep.episodeIndex + 1}集</span>
+                            <span className={getStatusColor(ep.status)}>
+                      {ep.status === 'completed' && !ep.playbackUrl
+                        ? '等待 MP4'
+                        : getStatusText(ep.status)}
+                            </span>
+                            {ep.playbackUrl ? (
+                              <>
+                                <a
+                                  href={getPlaybackUrl(ep)}
+                                  target='_blank'
+                                  rel='noreferrer'
+                                  className='ml-1 inline-flex items-center gap-1 rounded px-2 py-1 text-blue-600 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-900/30'
+                                  aria-label={`播放第 ${ep.episodeIndex + 1} 集服务器缓存`}
+                                >
+                                  <ExternalLink className='h-3.5 w-3.5' />
+                                  播放
+                                </a>
+                                <button
+                                  type='button'
+                                  onClick={() => void handleCopyPlaybackUrl(ep)}
+                                  className='inline-flex items-center gap-1 rounded px-2 py-1 text-blue-600 hover:bg-blue-50 dark:text-blue-300 dark:hover:bg-blue-900/30'
+                                  aria-label={`复制第 ${ep.episodeIndex + 1} 集播放网址`}
+                                >
+                                  {copiedTaskId === ep.id ? (
+                                    <Check className='h-3.5 w-3.5' />
+                                  ) : (
+                                    <Copy className='h-3.5 w-3.5' />
+                                  )}
+                                  {copiedTaskId === ep.id ? '已复制' : '复制网址'}
+                                </button>
+                              </>
+                            ) : null}
                             <button
-                              onClick={() => {
-                                if (confirm(`确定要删除第${ep.episodeIndex + 1}集吗？`)) {
-                                  handleDeleteTask(ep.id);
-                                }
-                              }}
-                              className='ml-1 opacity-0 group-hover:opacity-100 transition-opacity text-red-600 dark:text-red-400 hover:text-red-700 dark:hover:text-red-300'
+                              type='button'
+                              onClick={() => void handleDeleteTask(ep)}
+                              disabled={deletingTaskId === ep.id}
+                              className='ml-1 inline-flex items-center gap-1 rounded px-2 py-1 text-red-600 transition-colors hover:bg-red-50 hover:text-red-700 disabled:cursor-wait disabled:opacity-50 dark:text-red-400 dark:hover:bg-red-900/30 dark:hover:text-red-300'
                               title='删除此集'
+                              aria-label={`删除第 ${ep.episodeIndex + 1} 集服务器缓存`}
                             >
                               <svg className='w-3 h-3' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
                                 <path
@@ -322,9 +459,15 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                       </div>
                       {/* 删除全部按钮 */}
                       <button
-                        onClick={() => {
-                          if (confirm(`确定要删除《${video.metadata?.videoTitle || video.title}》的所有已下载集数吗？`)) {
-                            episodes.forEach((ep) => handleDeleteTask(ep.id));
+                        onClick={async () => {
+                          const videoTitle = video.metadata?.videoTitle || video.title;
+                          const episodeList = episodes
+                            .map((episode) => `第 ${episode.episodeIndex + 1} 集`)
+                            .join('、');
+                          if (confirm(`确定删除服务器上的缓存文件吗？\n\n片名：${videoTitle}\n来源：${video.source}\n集数：${episodeList}`)) {
+                            for (const episode of episodes) {
+                              await handleDeleteTask(episode, true);
+                            }
                           }
                         }}
                         className='flex items-center gap-1 px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white text-xs font-medium rounded transition-colors'
@@ -376,7 +519,7 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                   </div>
                   <div className='flex items-center gap-2 ml-4'>
                     <span className={`text-xs font-medium ${getStatusColor(task.status)}`}>
-                      {getStatusText(task.status)}
+                      {getTaskStatusText(task)}
                     </span>
                   </div>
                 </div>
@@ -393,7 +536,7 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                     <div className='w-full bg-gray-200 dark:bg-gray-600 rounded-full h-2 overflow-hidden'>
                       <div
                         className={`h-full rounded-full transition-all duration-300 ${
-                          task.status === 'downloading'
+                          task.status === 'downloading' || task.status === 'remuxing'
                             ? 'bg-gradient-to-r from-blue-500 to-purple-600 animate-pulse'
                             : task.status === 'completed'
                             ? 'bg-green-500'
@@ -421,9 +564,36 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                 </div>
 
                 {/* 操作按钮 */}
-                <div className='flex items-center gap-2'>
+                <div className='flex flex-wrap items-center gap-2'>
+                  {task.status === 'completed' && task.playbackUrl ? (
+                    <>
+                      <a
+                        href={getPlaybackUrl(task)}
+                        target='_blank'
+                        rel='noreferrer'
+                        className='flex items-center gap-1 rounded bg-green-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-green-700'
+                      >
+                        <ExternalLink className='h-4 w-4' />
+                        播放缓存
+                      </a>
+                      <button
+                        type='button'
+                        onClick={() => void handleCopyPlaybackUrl(task)}
+                        className='flex items-center gap-1 rounded bg-blue-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-600'
+                      >
+                        {copiedTaskId === task.id ? (
+                          <Check className='h-4 w-4' />
+                        ) : (
+                          <Copy className='h-4 w-4' />
+                        )}
+                        {copiedTaskId === task.id ? '已复制播放网址' : '复制播放网址'}
+                      </button>
+                    </>
+                  ) : null}
                   {/* 重试按钮 - 只在错误或暂停状态显示 */}
-                  {(task.status === 'error' || task.status === 'paused') && (
+                  {(task.status === 'error' ||
+                    task.status === 'paused' ||
+                    (task.status === 'completed' && !task.playbackUrl)) && (
                     <button
                       onClick={() => handleRetryTask(task.id)}
                       className='flex items-center gap-1 px-3 py-1.5 bg-blue-500 hover:bg-blue-600 text-white text-xs font-medium rounded transition-colors'
@@ -436,12 +606,13 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                           d='M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15'
                         />
                       </svg>
-                      重试
+                      {task.status === 'completed' ? '生成 MP4' : '重试'}
                     </button>
                   )}
                   <button
-                    onClick={() => handleDeleteTask(task.id)}
-                    className='flex items-center gap-1 px-3 py-1.5 bg-red-500 hover:bg-red-600 text-white text-xs font-medium rounded transition-colors'
+                    onClick={() => void handleDeleteTask(task)}
+                    disabled={deletingTaskId === task.id}
+                    className='flex items-center gap-1 rounded bg-red-500 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-red-600 disabled:cursor-wait disabled:opacity-50'
                   >
                     <svg className='w-4 h-4' fill='none' stroke='currentColor' viewBox='0 0 24 24'>
                       <path
@@ -451,7 +622,7 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
                         d='M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16'
                       />
                     </svg>
-                    删除
+                    {deletingTaskId === task.id ? '删除中…' : '删除缓存'}
                   </button>
                 </div>
               </div>
@@ -462,5 +633,5 @@ export function OfflineDownloadPanel({ isOpen, onClose }: OfflineDownloadPanelPr
     </div>
   );
 
-  return createPortal(panelContent, document.body);
+  return embedded ? panelContent : createPortal(panelContent, document.body);
 }

@@ -1,6 +1,13 @@
 /* eslint-disable @next/next/no-img-element */
 
-import React, { useMemo,useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
+
+export interface ServerDownloadEpisodeState {
+  status: 'pending' | 'downloading' | 'remuxing' | 'completed' | 'error' | 'paused';
+  playbackUrl?: string;
+}
+
+const EMPTY_EPISODE_URLS: string[] = [];
 
 interface DownloadEpisodeSelectorProps {
   /** 是否显示弹窗 */
@@ -16,7 +23,14 @@ interface DownloadEpisodeSelectorProps {
   /** 当前集数索引（0开始） */
   currentEpisodeIndex: number;
   /** 下载回调 - 支持批量下载 */
-  onDownload: (episodeIndexes: number[], offlineMode: boolean) => void;
+  onDownload: (
+    episodeIndexes: number[],
+    offlineMode: boolean
+  ) => void | Promise<void>;
+  forceOfflineMode?: boolean;
+  episodeUrls?: string[];
+  offlineEpisodeStates?: Record<number, ServerDownloadEpisodeState>;
+  offlineStatesLoading?: boolean;
   /** 是否启用离线下载功能 */
   enableOfflineDownload?: boolean;
   /** 是否有离线下载权限（管理员或站长） */
@@ -34,6 +48,10 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
   videoTitle,
   currentEpisodeIndex,
   onDownload,
+  forceOfflineMode = false,
+  episodeUrls = EMPTY_EPISODE_URLS,
+  offlineEpisodeStates = {},
+  offlineStatesLoading = false,
   enableOfflineDownload = false,
   hasOfflinePermission = false,
 }) => {
@@ -43,11 +61,47 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
   );
 
   // 离线下载模式
-  const [offlineMode, setOfflineMode] = useState(false);
+  const [offlineMode, setOfflineMode] = useState(forceOfflineMode);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState('');
 
   // 每页显示的集数
   const episodesPerPage = 50;
   const pageCount = Math.ceil(totalEpisodes / episodesPerPage);
+  const isServerDownload = forceOfflineMode || offlineMode;
+  const eligibleEpisodes = useMemo(
+    () =>
+      Array.from({ length: totalEpisodes }, (_, index) => index).filter(
+        (index) =>
+          !offlineEpisodeStates[index] &&
+          (!isServerDownload || Boolean(episodeUrls[index]?.match(/m3u8/i)))
+      ),
+    [episodeUrls, isServerDownload, offlineEpisodeStates, totalEpisodes]
+  );
+
+  useEffect(() => {
+    if (!isOpen) return;
+    setOfflineMode(forceOfflineMode);
+    setSelectedEpisodes(new Set([currentEpisodeIndex]));
+    setSubmitError('');
+    setIsSubmitting(false);
+  }, [currentEpisodeIndex, forceOfflineMode, isOpen]);
+
+  useEffect(() => {
+    const eligible = new Set(eligibleEpisodes);
+    setSelectedEpisodes((previous) => {
+      const next = new Set(
+        Array.from(previous).filter((index) => eligible.has(index))
+      );
+      if (next.size === 0 && eligible.has(currentEpisodeIndex)) {
+        next.add(currentEpisodeIndex);
+      }
+      if (next.size === 0 && eligibleEpisodes.length > 0) {
+        next.add(eligibleEpisodes[0]);
+      }
+      return next;
+    });
+  }, [currentEpisodeIndex, eligibleEpisodes]);
 
   // 当前分页索引（0 开始）
   const initialPage = Math.floor(currentEpisodeIndex / episodesPerPage);
@@ -92,6 +146,8 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
   };
 
   const handleEpisodeClick = (episodeIndex: number) => {
+    if (isSubmitting || offlineEpisodeStates[episodeIndex]) return;
+
     setSelectedEpisodes((prev) => {
       const newSet = new Set(prev);
       if (newSet.has(episodeIndex)) {
@@ -104,18 +160,33 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
   };
 
   const handleSelectAll = () => {
-    const allEpisodes = Array.from({ length: totalEpisodes }, (_, i) => i);
-    setSelectedEpisodes(new Set(allEpisodes));
+    if (isSubmitting) return;
+    setSelectedEpisodes(new Set(eligibleEpisodes));
   };
 
   const handleClearAll = () => {
+    if (isSubmitting) return;
     setSelectedEpisodes(new Set());
   };
 
-  const handleDownload = () => {
-    const episodeIndexes = Array.from(selectedEpisodes).sort((a, b) => a - b);
-    onDownload(episodeIndexes, offlineMode);
-    onClose();
+  const handleDownload = async () => {
+    const episodeIndexes = Array.from(selectedEpisodes)
+      .filter((index) => eligibleEpisodes.includes(index))
+      .sort((a, b) => a - b);
+    if (episodeIndexes.length === 0 || isSubmitting) return;
+
+    setIsSubmitting(true);
+    setSubmitError('');
+    try {
+      await onDownload(episodeIndexes, isServerDownload);
+      onClose();
+    } catch (error) {
+      setSubmitError(
+        error instanceof Error ? error.message : '提交下载任务失败'
+      );
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   const currentStart = currentPage * episodesPerPage;
@@ -171,7 +242,11 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
         </div>
 
         {/* 离线下载开关 - 仅管理员和站长可见 */}
-        {enableOfflineDownload && hasOfflinePermission && (
+        {forceOfflineMode ? (
+          <div className='border-b border-blue-100 bg-blue-50 px-6 py-3 text-sm text-blue-800 dark:border-blue-900/30 dark:bg-blue-900/10 dark:text-blue-200'>
+            任务会在服务器后台继续运行，完成后可在下载文件管理中查看。
+          </div>
+        ) : enableOfflineDownload && hasOfflinePermission ? (
           <div className='flex items-center justify-between px-6 py-3 bg-blue-50 dark:bg-blue-900/10 border-b border-blue-100 dark:border-blue-900/30'>
             <div className='flex items-center gap-3'>
               {/* 服务器图标 */}
@@ -212,7 +287,13 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
               />
             </button>
           </div>
-        )}
+        ) : null}
+
+        {isServerDownload && offlineStatesLoading ? (
+          <p className='border-b border-gray-200 px-6 py-2 text-xs text-gray-500 dark:border-gray-700 dark:text-gray-400' role='status'>
+            正在读取缓存状态…
+          </p>
+        ) : null}
 
         {/* 分页标签 */}
         {pageCount > 1 && (
@@ -274,16 +355,41 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
               const isSelected = selectedEpisodes.has(episodeIndex);
               const isCurrent = episodeIndex === currentEpisodeIndex;
               const episodeNumber = episodeIndex + 1;
+              const downloadState = isServerDownload
+                ? offlineEpisodeStates[episodeIndex]
+                : undefined;
+              const hasEpisodeUrl = Boolean(episodeUrls[episodeIndex]?.match(/m3u8/i));
+              const isDisabled =
+                isSubmitting ||
+                Boolean(downloadState) ||
+                (isServerDownload && !hasEpisodeUrl);
               return (
                 <button
                   key={episodeIndex}
                   onClick={() => handleEpisodeClick(episodeIndex)}
+                  disabled={isDisabled}
+                  title={
+                    downloadState?.status === 'completed'
+                      ? downloadState.playbackUrl
+                        ? '该集已缓存完成'
+                        : '该集已有缓存任务'
+                      : downloadState
+                        ? '该集已有服务端缓存任务'
+                        : isServerDownload && !hasEpisodeUrl
+                          ? '没有该集的片源地址'
+                          : undefined
+                  }
                   className={`h-10 min-w-10 px-3 py-2 flex items-center justify-center text-sm font-medium rounded-md transition-all duration-200 whitespace-nowrap font-mono relative
                     ${
                       isSelected
                         ? 'bg-green-500 text-white shadow-lg shadow-green-500/25 dark:bg-green-600'
-                        : 'bg-gray-200 text-gray-700 hover:bg-gray-300 hover:scale-105 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600'
+                        : downloadState?.status === 'completed'
+                          ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-200'
+                          : downloadState
+                            ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-200'
+                            : 'bg-gray-200 text-gray-700 hover:bg-gray-300 hover:scale-105 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600'
                     }
+                    disabled:cursor-not-allowed disabled:opacity-60
                   `.trim()}
                 >
                   {(() => {
@@ -305,11 +411,28 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
                   {isCurrent && (
                     <span className='absolute -top-1 -right-1 w-2 h-2 bg-blue-500 rounded-full'></span>
                   )}
+                  {downloadState ? (
+                    <span className='ml-1 font-sans text-[10px]'>
+                      {downloadState.status === 'completed'
+                        ? '已缓存'
+                        : downloadState.status === 'remuxing'
+                          ? '封装中'
+                          : downloadState.status === 'error' || downloadState.status === 'paused'
+                            ? '可重试'
+                            : '缓存中'}
+                    </span>
+                  ) : null}
                 </button>
               );
             })}
           </div>
         </div>
+
+        {submitError ? (
+          <p className='border-t border-red-200 px-6 py-2 text-sm text-red-600 dark:border-red-800 dark:text-red-300' role='alert'>
+            {submitError}
+          </p>
+        ) : null}
 
         {/* 底部操作栏 */}
         <div className='flex items-center justify-between px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900'>
@@ -327,7 +450,7 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
             ) : (
               <span className='font-medium text-green-600 dark:text-green-400'>
                 {selectedEpisodes.size} 集
-              </span>
+            </span>
             )}
           </div>
           <div className='flex gap-3'>
@@ -339,14 +462,16 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
             </button>
             <button
               onClick={handleDownload}
-              disabled={selectedEpisodes.size === 0}
+              disabled={selectedEpisodes.size === 0 || isSubmitting || offlineStatesLoading}
               className={`px-4 py-2 text-sm font-medium text-white rounded-md transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed ${
-                offlineMode && enableOfflineDownload && hasOfflinePermission
+                isServerDownload && enableOfflineDownload && hasOfflinePermission
                   ? 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-800'
                   : 'bg-green-500 hover:bg-green-600 dark:bg-green-600 dark:hover:bg-green-700 disabled:hover:bg-green-500'
               }`}
             >
-              {offlineMode && enableOfflineDownload && hasOfflinePermission ? '离线' : ''}下载 {selectedEpisodes.size > 0 && `(${selectedEpisodes.size})`}
+              {isSubmitting
+                ? '正在提交…'
+                : `${isServerDownload && enableOfflineDownload && hasOfflinePermission ? '加入服务器缓存' : '下载'} ${selectedEpisodes.size > 0 ? `(${selectedEpisodes.size})` : ''}`}
             </button>
           </div>
         </div>

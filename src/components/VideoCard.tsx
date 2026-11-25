@@ -2,6 +2,7 @@
 
 import {
   Cloud,
+  Download,
   ExternalLink,
   Heart,
   Info,
@@ -22,12 +23,12 @@ import React, {
   useEffect,
   useImperativeHandle,
   useMemo,
-  useRef,
   useState,
 } from 'react';
 
 import { isAnimeCategoryText } from '@/lib/anime-keyword-expr';
 import { getAuthInfoFromBrowserCookie } from '@/lib/auth';
+import { getBangumiSubjectUrl } from '@/lib/bangumi.client';
 import {
   deleteFavorite,
   deletePlayRecord,
@@ -36,10 +37,10 @@ import {
   saveFavorite,
   subscribeToDataUpdates,
 } from '@/lib/db.client';
-import { getBangumiSubjectUrl } from '@/lib/bangumi.client';
-import { isNetdiskSource } from '@/lib/netdisk/source';
 import { isDuanjuVerticalDisabled } from '@/lib/duanju.client';
+import { isNetdiskSource } from '@/lib/netdisk/source';
 import { appendSpecialSourceParam } from '@/lib/special-source.client';
+import type { TMDBVideoItem } from '@/lib/tmdb.client';
 import {
   base58Decode,
   clearBangumiImageFallbackCacheIfFailed,
@@ -55,12 +56,14 @@ import { useLongPress } from '@/hooks/useLongPress';
 import AIChatPanel from '@/components/AIChatPanel';
 import AnimeSubscribeModal from '@/components/AnimeSubscribeModal';
 import DetailPanel from '@/components/DetailPanel';
+import DownloadEpisodeSelector, {
+  type ServerDownloadEpisodeState,
+} from '@/components/DownloadEpisodeSelector';
 import { ImagePlaceholder } from '@/components/ImagePlaceholder';
 import ImageViewer from '@/components/ImageViewer';
 import MobileActionSheet from '@/components/MobileActionSheet';
 import TrailerPickerDialog from '@/components/TrailerPickerDialog';
 import { useWatchRoomContextSafe } from '@/components/WatchRoomProvider';
-import type { TMDBVideoItem } from '@/lib/tmdb.client';
 
 export interface VideoCardProps {
   id?: string;
@@ -114,6 +117,17 @@ export type VideoCardHandle = {
   setSourceNames: (names?: string[]) => void;
   setDoubanId: (id?: number) => void;
 };
+
+interface ServerCacheEpisodeData {
+  source: string;
+  videoId: string;
+  urls: string[];
+  titles: string[];
+}
+
+function isHlsEpisodeUrl(url?: string): boolean {
+  return typeof url === 'string' && /m3u8/i.test(url);
+}
 
 const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
   function VideoCard(
@@ -192,6 +206,18 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
     const [favorited, setFavorited] = useState(false);
     const [isLoading, setIsLoading] = useState(false);
     const [showMobileActions, setShowMobileActions] = useState(false);
+    const [showServerCacheSelector, setShowServerCacheSelector] = useState(false);
+    const [serverCacheEpisodeStates, setServerCacheEpisodeStates] = useState<
+      Record<number, ServerDownloadEpisodeState>
+    >({});
+    const [serverCacheStatesLoading, setServerCacheStatesLoading] =
+      useState(false);
+    const [serverCacheSourceLoading, setServerCacheSourceLoading] =
+      useState(false);
+    const [resolvedServerEpisodeData, setResolvedServerEpisodeData] =
+      useState<ServerCacheEpisodeData | null>(null);
+    const [serverCacheFeedback, setServerCacheFeedback] = useState('');
+    const [serverCacheEnabled, setServerCacheEnabled] = useState(false);
     const [searchFavorited, setSearchFavorited] = useState<boolean | null>(
       null
     ); // 搜索结果的收藏状态
@@ -215,6 +241,9 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
     // 检查AI功能是否启用
     useEffect(() => {
       if (typeof window !== 'undefined') {
+        setServerCacheEnabled(
+          (window as any).RUNTIME_CONFIG?.ENABLE_OFFLINE_DOWNLOAD === true
+        );
         const enabled =
           (window as any).RUNTIME_CONFIG?.AI_ENABLED &&
           (window as any).RUNTIME_CONFIG?.AI_ENABLE_VIDEOCARD_ENTRY;
@@ -307,6 +336,92 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
         return '';
       }
     }, [isDirectPlaySource, actualId]);
+    const initialServerEpisodeUrls = cmsData?.episodes || [];
+    const canServerCache =
+      serverCacheEnabled &&
+      isAdminUser &&
+      from === 'source-search' &&
+      origin !== 'live' &&
+      Boolean(actualSource && actualId);
+    const currentServerCacheEpisodeData =
+      resolvedServerEpisodeData &&
+      resolvedServerEpisodeData.source === actualSource &&
+      resolvedServerEpisodeData.videoId === actualId
+        ? resolvedServerEpisodeData
+        : null;
+    const serverEpisodeUrls =
+      currentServerCacheEpisodeData?.urls || initialServerEpisodeUrls;
+    const serverEpisodeTitles =
+      currentServerCacheEpisodeData?.titles ||
+      initialServerEpisodeUrls.map(
+        (_, index) => cmsData?.episodes_titles?.[index] || `第 ${index + 1} 集`
+      );
+
+    useEffect(() => {
+      if (
+        !showServerCacheSelector ||
+        !canServerCache ||
+        !actualSource ||
+        !actualId
+      ) {
+        return;
+      }
+
+      const controller = new AbortController();
+      let isCurrentRequest = true;
+      setServerCacheStatesLoading(true);
+      setServerCacheEpisodeStates({});
+
+      void fetch('/api/offline-download', {
+        cache: 'no-store',
+        signal: controller.signal,
+      })
+        .then(async (response) => {
+          if (!response.ok) throw new Error('读取服务端缓存状态失败');
+          return (await response.json()) as {
+            tasks?: Array<{
+              source: string;
+              videoId: string;
+              episodeIndex: number;
+              status: ServerDownloadEpisodeState['status'];
+              playbackUrl?: string;
+            }>;
+          };
+        })
+        .then((data) => {
+          if (!isCurrentRequest) return;
+          const nextStates: Record<number, ServerDownloadEpisodeState> = {};
+          for (const task of data.tasks || []) {
+            if (task.source !== actualSource || task.videoId !== actualId) continue;
+            nextStates[task.episodeIndex] = {
+              status: task.status,
+              playbackUrl: task.playbackUrl,
+            };
+          }
+          setServerCacheEpisodeStates(nextStates);
+        })
+        .catch((error: unknown) => {
+          if (controller.signal.aborted || !isCurrentRequest) return;
+          setServerCacheFeedback(
+            error instanceof Error ? error.message : '读取服务端缓存状态失败'
+          );
+        })
+        .finally(() => {
+          if (isCurrentRequest) setServerCacheStatesLoading(false);
+        });
+
+      return () => {
+        isCurrentRequest = false;
+        controller.abort();
+      };
+    }, [actualId, actualSource, canServerCache, showServerCacheSelector]);
+
+    useEffect(() => {
+      if (!serverCacheFeedback) return;
+      const timeout = window.setTimeout(() => setServerCacheFeedback(''), 5000);
+      return () => window.clearTimeout(timeout);
+    }, [serverCacheFeedback]);
+
     const displayYear = useMemo(() => {
       if (!actualYear) return '';
       const normalized = actualYear.trim();
@@ -769,6 +884,160 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
       }
     }, [actualSearchType, actualTitle, actualYear, tmdb_id]);
 
+    const openServerCacheSelector = useCallback(() => {
+      setServerCacheFeedback('');
+      setShowMobileActions(false);
+      window.setTimeout(() => {
+        void (async () => {
+          if (!actualSource || !actualId) {
+            setServerCacheFeedback('缺少视频源信息，无法创建缓存任务');
+            return;
+          }
+
+          setServerCacheSourceLoading(true);
+          try {
+            let episodeUrls = initialServerEpisodeUrls;
+            let episodeTitles = episodeUrls.map(
+              (_, index) =>
+                cmsData?.episodes_titles?.[index] || `第 ${index + 1} 集`
+            );
+            const expectedEpisodes = Math.max(
+              actualEpisodes || 0,
+              episodeUrls.length
+            );
+            try {
+              const detailUrl = appendSpecialSourceParam(
+                `/api/detail?source=${encodeURIComponent(actualSource)}&id=${encodeURIComponent(actualId)}`
+              );
+              const response = await fetch(detailUrl, { cache: 'no-store' });
+              if (!response.ok) {
+                throw new Error(`详情请求失败（HTTP ${response.status}）`);
+              }
+              const detail = await response.json();
+              const detailUrls = Array.isArray(detail.episodes)
+                ? detail.episodes.filter((url: unknown): url is string => typeof url === 'string')
+                : [];
+              if (
+                detailUrls.length > 0 &&
+                detailUrls.some(isHlsEpisodeUrl)
+              ) {
+                episodeUrls = detailUrls;
+                episodeTitles = episodeUrls.map(
+                  (_: string, index: number) =>
+                    detail.episodes_titles?.[index] || `第 ${index + 1} 集`
+                );
+              }
+            } catch (detailError) {
+              if (!episodeUrls.some(isHlsEpisodeUrl)) throw detailError;
+              setServerCacheFeedback('详情服务不可用，将显示当前搜索结果中的可用集数');
+            }
+
+            if (episodeUrls.length < expectedEpisodes) {
+              setServerCacheFeedback(
+                `源站返回 ${episodeUrls.length} 集，本次会按可用集数显示`
+              );
+            }
+
+            if (!episodeUrls.some(isHlsEpisodeUrl)) {
+              throw new Error('当前源没有可用的 HLS 集地址，无法缓存');
+            }
+
+            setResolvedServerEpisodeData({
+              source: actualSource,
+              videoId: actualId,
+              urls: episodeUrls,
+              titles: episodeTitles,
+            });
+            setShowServerCacheSelector(true);
+          } catch (error) {
+            setServerCacheFeedback(
+              error instanceof Error ? error.message : '获取集数失败'
+            );
+          } finally {
+            setServerCacheSourceLoading(false);
+          }
+        })();
+      }, 220);
+    }, [
+      actualEpisodes,
+      actualId,
+      actualSource,
+      cmsData?.episodes_titles,
+      initialServerEpisodeUrls,
+    ]);
+
+    const handleServerCacheDownload = useCallback(
+      async (episodeIndexes: number[], offlineMode: boolean) => {
+        if (!offlineMode || !canServerCache || !actualSource || !actualId) {
+          throw new Error('当前视频不能使用服务端缓存');
+        }
+
+        let accepted = 0;
+        const failures: string[] = [];
+
+        for (const episodeIndex of episodeIndexes) {
+          const episodeUrl = serverEpisodeUrls[episodeIndex];
+          if (!isHlsEpisodeUrl(episodeUrl)) {
+            failures.push(`第 ${episodeIndex + 1} 集不是可缓存的 HLS 视频`);
+            continue;
+          }
+
+          try {
+            const response = await fetch('/api/offline-download', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                source: actualSource,
+                videoId: actualId,
+                episodeIndex,
+                title: `${actualTitle}_第${episodeIndex + 1}集`,
+                m3u8Url: episodeUrl,
+                metadata: {
+                  videoTitle: actualTitle,
+                  cover: actualPoster,
+                  description: cmsData?.desc,
+                  year: actualYear,
+                  totalEpisodes: serverEpisodeUrls.length,
+                },
+              }),
+            });
+            const result = await response.json().catch(() => ({}));
+            if (!response.ok) {
+              throw new Error(result.error || result.message || `HTTP ${response.status}`);
+            }
+            accepted += 1;
+          } catch (error) {
+            failures.push(
+              `第 ${episodeIndex + 1} 集：${error instanceof Error ? error.message : '提交失败'}`
+            );
+          }
+        }
+
+        if (accepted > 0) {
+          window.dispatchEvent(new Event('serverOfflineDownloadsUpdated'));
+          setServerCacheFeedback(
+            failures.length > 0
+              ? `已提交 ${accepted} 集，${failures.length} 集失败。${failures[0]}`
+              : `已提交 ${accepted} 集到服务器缓存任务`
+          );
+          return;
+        }
+
+        throw new Error(failures[0] || '没有提交任何缓存任务');
+      },
+      [
+        actualId,
+        actualPoster,
+        actualSource,
+        actualTitle,
+        actualYear,
+        canServerCache,
+        cmsData?.desc,
+        serverEpisodeTitles,
+        serverEpisodeUrls,
+      ]
+    );
+
     // 移动端操作菜单配置
     const mobileActions = useMemo(() => {
       const actions = [];
@@ -789,6 +1058,16 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
           label: origin === 'live' ? '新标签页观看' : '新标签页播放',
           icon: <ExternalLink size={20} />,
           onClick: handlePlayInNewTab,
+          color: 'default' as const,
+        });
+      }
+
+      if (canServerCache) {
+        actions.push({
+          id: 'server-cache',
+          label: '服务端缓存',
+          icon: <Download size={20} />,
+          onClick: openServerCacheSelector,
           color: 'default' as const,
         });
       }
@@ -971,6 +1250,8 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
     }, [
       config,
       from,
+      canServerCache,
+      openServerCacheSelector,
       actualSource,
       actualId,
       favorited,
@@ -2182,6 +2463,32 @@ const VideoCard = forwardRef<VideoCardHandle, VideoCardProps>(
           }}
         />
 
+        {canServerCache ? (
+          <DownloadEpisodeSelector
+            isOpen={showServerCacheSelector}
+            onClose={() => setShowServerCacheSelector(false)}
+            totalEpisodes={serverEpisodeUrls.length}
+            episodesTitles={serverEpisodeTitles}
+            episodeUrls={serverEpisodeUrls}
+            videoTitle={actualTitle}
+            currentEpisodeIndex={0}
+            onDownload={handleServerCacheDownload}
+            forceOfflineMode
+            enableOfflineDownload={serverCacheEnabled}
+            hasOfflinePermission={isAdminUser}
+            offlineEpisodeStates={serverCacheEpisodeStates}
+            offlineStatesLoading={serverCacheStatesLoading}
+          />
+        ) : null}
+
+        {serverCacheSourceLoading || serverCacheFeedback ? (
+          <div
+            className='fixed bottom-24 left-1/2 z-[10001] -translate-x-1/2 rounded-full bg-blue-600 px-4 py-2 text-sm text-white shadow-lg'
+            role='status'
+          >
+            {serverCacheFeedback || '正在读取源站集数…'}
+          </div>
+        ) : null}
 
         <TrailerPickerDialog
           isOpen={showTrailerPicker}
