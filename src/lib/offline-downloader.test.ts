@@ -73,6 +73,33 @@ function makeChildProcess(stdout: string, closeCode: number | null = 0, onRun?: 
   return child;
 }
 
+function makeChunkedChildProcess(chunks: Buffer[], closeCode = 0) {
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    exitCode: number | null;
+    signalCode: NodeJS.Signals | null;
+    kill: jest.Mock;
+  };
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.exitCode = null;
+  child.signalCode = null;
+  child.kill = jest.fn((signal: NodeJS.Signals) => {
+    child.signalCode = signal;
+    setTimeout(() => child.emit('close', null, signal), 0);
+    return true;
+  });
+  setTimeout(() => {
+    for (const chunk of chunks) child.stdout.write(chunk);
+    child.stdout.end();
+    child.stderr.end();
+    child.exitCode = closeCode;
+    child.emit('close', closeCode, null);
+  }, 0);
+  return child;
+}
+
 function writeTsSegment(filePath: string) {
   const segment = Buffer.alloc(188);
   segment[0] = 0x47;
@@ -255,6 +282,45 @@ describe('OfflineDownloader HLS publication', () => {
     expect(fs.existsSync(path.join(exportRoot, 'hls', UUID))).toBe(false);
     expect(fs.readdirSync(exportRoot)).toEqual(['hls']);
     expect(fs.existsSync(path.join(task.downloadDir, 'playlist.m3u8'))).toBe(true);
+  });
+
+  it('streams large FFprobe stdout with backpressure and consumes an unterminated UTF-8 tail', async () => {
+    const output = Buffer.from(
+      `${Array.from({ length: 5000 }, (_, index) => `packet-${index.toString().padStart(5, '0')}`).join('\n')}\n尾行无换行`,
+      'utf8'
+    );
+    const chunks: Buffer[] = [];
+    for (let offset = 0; offset < output.length; offset += 8192) {
+      chunks.push(output.subarray(offset, Math.min(offset + 8192, output.length)));
+    }
+    const child = makeChunkedChildProcess(chunks);
+    mockSpawn.mockReturnValue(child as unknown as ReturnType<typeof spawn>);
+    const received: string[] = [];
+    const downloaderInternals = downloader as unknown as {
+      runProcessLines: (
+        command: string,
+        taskId: string,
+        args: string[],
+        signal: AbortSignal,
+        onLine: (line: string) => Promise<void>
+      ) => Promise<void>;
+    };
+
+    await downloaderInternals.runProcessLines(
+      'ffprobe',
+      'large-output',
+      [],
+      new AbortController().signal,
+      async (line) => {
+        await Promise.resolve();
+        received.push(line);
+      }
+    );
+
+    expect(received).toHaveLength(5001);
+    expect(received[0]).toBe('packet-00000');
+    expect(received[4999]).toBe('packet-04999');
+    expect(received[5000]).toBe('尾行无换行');
   });
 
   it('deletes private HLS, public HLS, legacy MP4, and only this task temp files', async () => {

@@ -8,8 +8,8 @@ import { type ChildProcess,spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createInterface } from 'readline';
 import { pipeline } from 'stream/promises';
+import { StringDecoder } from 'string_decoder';
 import { URL } from 'url';
 
 import {
@@ -1009,11 +1009,36 @@ export class OfflineDownloader {
       killTimeout.unref();
     };
     signal.addEventListener('abort', abortProcess, { once: true });
-    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
-    try {
-      for await (const line of lines) {
+    const stdout = child.stdout;
+    if (!stdout) {
+      signal.removeEventListener('abort', abortProcess);
+      this.childProcesses.delete(taskId);
+      throw new Error(`${command} stdout 未创建`);
+    }
+    const decoder = new StringDecoder('utf8');
+    let pendingText = '';
+    const consumeCompleteLines = async () => {
+      let newlineIndex = pendingText.indexOf('\n');
+      while (newlineIndex >= 0) {
+        const line = pendingText.slice(0, newlineIndex).replace(/\r$/, '');
+        pendingText = pendingText.slice(newlineIndex + 1);
         this.throwIfAborted(signal);
         await onLine(line);
+        newlineIndex = pendingText.indexOf('\n');
+      }
+    };
+    try {
+      for await (const chunk of stdout) {
+        this.throwIfAborted(signal);
+        pendingText += decoder.write(
+          typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk
+        );
+        await consumeCompleteLines();
+      }
+      pendingText += decoder.end();
+      if (pendingText.length > 0) {
+        this.throwIfAborted(signal);
+        await onLine(pendingText.replace(/\r$/, ''));
       }
       const result = await closed;
       if (signal.aborted) throw new Error('任务已取消');
@@ -1036,7 +1061,6 @@ export class OfflineDownloader {
       if (signal.aborted) throw new Error('任务已取消');
       throw error;
     } finally {
-      lines.close();
       signal.removeEventListener('abort', abortProcess);
       this.childProcesses.delete(taskId);
     }
