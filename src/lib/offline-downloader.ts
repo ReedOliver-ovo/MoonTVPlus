@@ -8,9 +8,16 @@ import { type ChildProcess,spawn } from 'child_process';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
+import { createInterface } from 'readline';
 import { pipeline } from 'stream/promises';
 import { URL } from 'url';
 
+import {
+  getH264SlicePpsIds,
+  hasH264Idr,
+  parseAvcDecoderConfiguration,
+  updateH264ParameterSets,
+} from './offline-hls-publisher';
 import { safeFetch } from './safe-http';
 
 export interface OfflineDownloadTask {
@@ -50,6 +57,25 @@ interface KeyInfo {
   method: string;
   uri: string;
   iv?: string;
+}
+
+interface VideoPacket {
+  index: number;
+  pts: number;
+  keyframe: boolean;
+  idr: boolean;
+}
+
+interface HlsBoundary {
+  frame: number;
+  pts: number;
+  discontinuity: boolean;
+}
+
+interface SegmentListEntry {
+  filename: string;
+  start: number;
+  end: number;
 }
 
 function combineAbortSignals(signals: AbortSignal[]): AbortSignal {
@@ -95,6 +121,9 @@ export class OfflineDownloader {
   private concurrency = 6;
   private proxy?: string;
   private childProcesses = new Map<string, ChildProcess>();
+  private publicationControllers = new Map<string, AbortController>();
+  private publicationOperations = new Map<string, Promise<void>>();
+  private validatedPublishedIds = new Set<string>();
 
   constructor(baseDir: string, proxy?: string, exportDir?: string) {
     this.baseDir = baseDir;
@@ -573,87 +602,573 @@ export class OfflineDownloader {
     return response.text();
   }
 
-  async remuxToMp4(task: OfflineDownloadTask, signal?: AbortSignal): Promise<void> {
-    if (!this.exportDir) throw new Error('服务器 MP4 发布目录未配置');
-    this.throwIfAborted(signal);
-    if (!task.playbackId || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(task.playbackId)) {
-      throw new Error('缓存链接标识无效');
+  async publishHls(task: OfflineDownloadTask, signal?: AbortSignal): Promise<void> {
+    if (!this.exportDir) throw new Error('HLS 兼容播放发布目录未配置');
+    const playbackId = this.getOrCreatePlaybackId(task).toLowerCase();
+    this.getPublishedHlsDirectory(playbackId);
+    this.assertTaskDownloadDirectory(task);
+    if (this.getPlaybackUrl(task)) return;
+
+    const existingOperation = this.publicationOperations.get(task.id);
+    if (existingOperation) {
+      await existingOperation;
+      return;
     }
 
-    const outputPath = this.getPublishedPath(task.playbackId);
-    this.ensureDir(this.exportDir);
-    if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) return;
-
-    const playlistPath = path.join(task.downloadDir, 'playlist.m3u8');
-    if (!await this.verifyDownload(task.downloadDir)) {
-      throw new Error('本地 HLS 缓存不完整，无法生成 MP4');
-    }
-    const tempPlaylist = path.join(task.downloadDir, `remux-${task.playbackId}.m3u8`);
-    const tempOutput = path.join(this.exportDir, `.${task.playbackId}.${randomUUID()}.part.mp4`);
-    const localLines = this.createRemuxPlaylist(playlistPath, task.downloadDir);
-    fs.writeFileSync(tempPlaylist, localLines.join('\n') + '\n', 'utf-8');
-
+    const controller = new AbortController();
+    const combinedSignal = signal
+      ? combineAbortSignals([signal, controller.signal])
+      : controller.signal;
+    this.publicationControllers.set(task.id, controller);
+    const operation = this.publishHlsInternal(task, playbackId, combinedSignal);
+    this.publicationOperations.set(task.id, operation);
     try {
-      const outputBytes = await this.getAvailableOutputBytes(task.downloadDir);
-      const minimumFreeBytes = Math.max(32 * 1024 * 1024, outputBytes * 1.1 + 8 * 1024 * 1024);
-      const filesystemStats = await fs.promises.statfs(this.exportDir);
-      const availableBytes = Number(filesystemStats.bavail) * Number(filesystemStats.bsize);
-      if (availableBytes < minimumFreeBytes) {
-        throw new Error('服务器磁盘剩余空间不足，MP4 封装暂未开始；已缓存的 HLS 分片仍可在 MoonTVPlus 内播放');
-      }
-
-      const probeOutput = await this.runProcess('ffprobe', task.id, [
-        '-v', 'error',
-        '-protocol_whitelist', 'file,crypto,data',
-        '-allowed_extensions', 'ALL',
-        '-show_entries', 'stream=codec_type,codec_name',
-        '-of', 'json',
-        tempPlaylist,
-      ], signal);
-      const streams = (JSON.parse(probeOutput) as { streams?: { codec_type?: string; codec_name?: string }[] }).streams || [];
-      const videoCodec = streams.find((stream) => stream.codec_type === 'video')?.codec_name;
-      const audioCodecs = streams.filter((stream) => stream.codec_type === 'audio').map((stream) => stream.codec_name);
-      if (videoCodec !== 'h264' || audioCodecs.some((codec) => codec !== 'aac')) {
-        const audioText = audioCodecs.length > 0 ? audioCodecs.join(', ') : '无音轨';
-        throw new Error(`检测到视频编码 ${videoCodec || '未知'}、音频编码 ${audioText}，当前不能保证手机和电脑浏览器播放。原 HLS 缓存仍保留，可在 MoonTVPlus 内播放`);
-      }
-
-      await this.runProcess('ffmpeg', task.id, [
-        '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
-        '-protocol_whitelist', 'file,crypto,data',
-        '-allowed_extensions', 'ALL',
-        '-i', tempPlaylist,
-        '-map', '0:v:0', '-map', '0:a?',
-        '-c', 'copy', '-movflags', '+faststart',
-        '-f', 'mp4', tempOutput,
-      ], signal);
-      this.throwIfAborted(signal);
-      const exportedStats = await fs.promises.stat(tempOutput);
-      if (exportedStats.size === 0) throw new Error('FFmpeg 封装完成，但生成的 MP4 文件为空');
-      await fs.promises.rename(tempOutput, outputPath);
-    } catch (error) {
-      await fs.promises.rm(tempOutput, { force: true });
-      const message = this.formatError(error);
-      if (message.includes('space left') || (error as NodeJS.ErrnoException).code === 'ENOSPC') {
-        throw new Error('服务器磁盘空间不足，MP4 封装失败；HLS 缓存仍保留，可在 MoonTVPlus 内播放');
-      }
-      throw new Error(message);
+      await operation;
     } finally {
-      this.childProcesses.delete(task.id);
-      await fs.promises.rm(tempPlaylist, { force: true });
+      this.publicationOperations.delete(task.id);
+      this.publicationControllers.delete(task.id);
+    }
+  }
+
+  hasLegacyMp4(task: OfflineDownloadTask): boolean {
+    if (!this.exportDir || !task.playbackId) return false;
+    try {
+      const legacyPath = this.getLegacyMp4Path(task.playbackId);
+      return fs.statSync(legacyPath).isFile() && fs.statSync(legacyPath).size > 0;
+    } catch {
+      return false;
     }
   }
 
   getPlaybackUrl(task: OfflineDownloadTask): string | undefined {
     if (!this.exportDir || !task.playbackId) return undefined;
-    const outputPath = this.getPublishedPath(task.playbackId);
-    if (!fs.existsSync(outputPath)) return undefined;
+    const playbackId = task.playbackId.toLowerCase();
+    let validId: string;
     try {
-      if (fs.statSync(outputPath).size === 0) return undefined;
+      validId = this.validatePlaybackId(playbackId);
     } catch {
       return undefined;
     }
-    return `/media/${task.playbackId}.mp4`;
+
+    if (!this.validatedPublishedIds.has(validId)) {
+      if (!this.isPublishedHlsReady(this.getPublishedHlsDirectory(validId))) return undefined;
+      this.validatedPublishedIds.add(validId);
+    }
+    return `/media/compat/${validId}`;
+  }
+
+  private async publishHlsInternal(
+    task: OfflineDownloadTask,
+    playbackId: string,
+    signal: AbortSignal
+  ): Promise<void> {
+    this.throwIfAborted(signal);
+    const exportDir = this.exportDir;
+    if (!exportDir) throw new Error('HLS 兼容播放发布目录未配置');
+    const hlsRoot = this.getPublishedHlsRoot();
+    const publishedDirectory = this.getPublishedHlsDirectory(playbackId);
+    this.ensureDir(exportDir);
+    this.ensureDir(hlsRoot);
+
+    const stagingDirectory = path.join(hlsRoot, `.${playbackId}.${randomUUID()}.tmp`);
+    const sanitizedPlaylist = path.join(task.downloadDir, `publish-${playbackId}.m3u8`);
+    const stagingMp4 = path.join(exportDir, `.${playbackId}.${randomUUID()}.stage.mp4`);
+
+    try {
+      if (fs.existsSync(publishedDirectory)) {
+        await fs.promises.rm(publishedDirectory, { recursive: true, force: true });
+      }
+      this.validatedPublishedIds.delete(playbackId);
+
+      const legacyMp4Path = this.hasLegacyMp4(task)
+        ? this.getLegacyMp4Path(playbackId)
+        : undefined;
+      let inputPath = legacyMp4Path;
+      let inputBytes: number;
+
+      if (legacyMp4Path) {
+        inputBytes = (await fs.promises.stat(legacyMp4Path)).size;
+        await this.ensureAvailableDiskSpace(inputBytes, false);
+      } else {
+        const sourcePlaylist = path.join(task.downloadDir, 'playlist.m3u8');
+        const localLines = this.createRemuxPlaylist(sourcePlaylist, task.downloadDir);
+        fs.writeFileSync(sanitizedPlaylist, `${localLines.join('\n')}\n`, 'utf-8');
+        inputBytes = await this.getAvailableOutputBytes(task.downloadDir);
+        await this.ensureAvailableDiskSpace(inputBytes, true);
+
+        const sourceStreams = await this.probeStreams(sanitizedPlaylist, task.id, signal);
+        this.assertBrowserCompatibleStreams(sourceStreams);
+        // Remove any incomplete file from an interrupted earlier attempt before FFmpeg opens it.
+        await fs.promises.rm(stagingMp4, { force: true });
+        await this.runProcess('ffmpeg', task.id, [
+          '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+          '-protocol_whitelist', 'file,crypto,data',
+          '-allowed_extensions', 'ALL',
+          '-i', sanitizedPlaylist,
+          '-map', '0:v:0', '-map', '0:a?',
+          '-c', 'copy', '-movflags', '+faststart',
+          '-f', 'mp4', stagingMp4,
+        ], signal);
+        this.throwIfAborted(signal);
+        const stageStats = await fs.promises.stat(stagingMp4);
+        if (!stageStats.isFile() || stageStats.size === 0) {
+          throw new Error('HLS 暂存 MP4 为空，无法生成兼容播放页');
+        }
+        inputPath = stagingMp4;
+      }
+
+      if (!inputPath) throw new Error('没有可用于生成 HLS 兼容播放页的本地缓存');
+      const publishedInputPath = inputPath;
+      const inputStreams = await this.probeStreams(publishedInputPath, task.id, signal, true);
+      this.assertBrowserCompatibleStreams(inputStreams);
+      if (!inputStreams.avcConfiguration) {
+        throw new Error('MP4 缺少 H.264 配置，无法安全切分为浏览器兼容的 HLS');
+      }
+
+      const inputStats = await fs.promises.stat(publishedInputPath);
+      await this.scanVideoPackets(
+        publishedInputPath,
+        task.id,
+        signal,
+        inputStreams.avcConfiguration,
+        inputStats.size,
+        async (boundaries, firstKeyframePts, packetCount) => {
+          this.ensureDir(stagingDirectory);
+          const csvPath = path.join(stagingDirectory, 'segments.csv');
+          const outputPattern = path.join(stagingDirectory, 'segment_%05d.ts');
+          const args = [
+            '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+            '-i', publishedInputPath,
+            '-map', '0:v:0', '-map', '0:a?',
+            '-c', 'copy',
+            '-f', 'segment',
+            '-segment_format', 'mpegts',
+            '-segment_list', csvPath,
+            '-segment_list_type', 'csv',
+            '-segment_list_size', '0',
+            '-reset_timestamps', '0',
+            '-segment_start_number', '0',
+          ];
+          const segmentFrames = boundaries.length > 0
+            ? boundaries.map((boundary) => String(boundary.frame)).join(',')
+            : String(packetCount + 1);
+          args.push('-segment_frames', segmentFrames);
+          args.push(outputPattern);
+          await this.runProcess('ffmpeg', task.id, args, signal);
+          this.throwIfAborted(signal);
+
+          const entries = this.readSegmentList(csvPath);
+          this.validateSegmentList(
+            entries,
+            boundaries,
+            firstKeyframePts,
+            stagingDirectory
+          );
+          const playlist = this.createPublishedPlaylist(entries, boundaries);
+          fs.writeFileSync(path.join(stagingDirectory, 'index.m3u8'), playlist, 'utf-8');
+          await fs.promises.rm(csvPath, { force: true });
+          if (!this.isPublishedHlsReady(stagingDirectory)) {
+            throw new Error('生成的 HLS 播放页或 TS 分片校验失败');
+          }
+
+          this.throwIfAborted(signal);
+          await fs.promises.rename(stagingDirectory, publishedDirectory);
+          this.validatedPublishedIds.add(playbackId);
+        }
+      );
+    } catch (error) {
+      const message = this.formatError(error);
+      if (message.includes('No space left') || (error as NodeJS.ErrnoException).code === 'ENOSPC') {
+        throw new Error('服务器磁盘空间不足，HLS 兼容播放页暂未生成；原缓存已保留，可重试');
+      }
+      throw error;
+    } finally {
+      this.childProcesses.delete(task.id);
+      await fs.promises.rm(sanitizedPlaylist, { force: true });
+      await fs.promises.rm(stagingMp4, { force: true });
+      await fs.promises.rm(stagingDirectory, { recursive: true, force: true });
+    }
+  }
+
+  private async ensureAvailableDiskSpace(inputBytes: number, needsStagingMp4: boolean): Promise<void> {
+    if (!this.exportDir || typeof fs.promises.statfs !== 'function') return;
+    const stats = await fs.promises.statfs(this.exportDir);
+    const availableBytes = Number(stats.bavail) * Number(stats.bsize);
+    const requiredBytes = Math.max(
+      32 * 1024 * 1024,
+      inputBytes * (needsStagingMp4 ? 2.1 : 1.1) + 8 * 1024 * 1024
+    );
+    if (availableBytes < requiredBytes) {
+      throw new Error('服务器磁盘剩余空间不足，HLS 兼容播放发布暂未开始；原缓存已保留，可重试');
+    }
+  }
+
+  private async probeStreams(
+    inputPath: string,
+    taskId: string,
+    signal: AbortSignal,
+    includeAvcConfiguration = false
+  ): Promise<{
+    streams: { codec_type?: string; codec_name?: string }[];
+    avcConfiguration?: ReturnType<typeof parseAvcDecoderConfiguration>;
+  }> {
+    const output = await this.runProcess('ffprobe', taskId, [
+      '-v', 'error',
+      '-protocol_whitelist', 'file,crypto,data',
+      '-allowed_extensions', 'ALL',
+      '-show_entries', 'stream=codec_type,codec_name,extradata',
+      ...(includeAvcConfiguration ? ['-show_data'] : []),
+      '-of', 'json',
+      inputPath,
+    ], signal);
+    const streams = (JSON.parse(output) as {
+      streams?: { codec_type?: string; codec_name?: string; extradata?: string }[];
+    }).streams || [];
+    let avcConfiguration: ReturnType<typeof parseAvcDecoderConfiguration> | undefined;
+    if (includeAvcConfiguration) {
+      const videoStream = streams.find((stream) => stream.codec_type === 'video');
+      if (videoStream?.extradata) {
+        avcConfiguration = parseAvcDecoderConfiguration(this.parseFfprobeHexDump(videoStream.extradata));
+      }
+    }
+    return { streams, avcConfiguration };
+  }
+
+  private assertBrowserCompatibleStreams(result: {
+    streams: { codec_type?: string; codec_name?: string }[];
+  }): void {
+    const videoCodec = result.streams.find((stream) => stream.codec_type === 'video')?.codec_name;
+    const audioCodecs = result.streams
+      .filter((stream) => stream.codec_type === 'audio')
+      .map((stream) => stream.codec_name || '未知');
+    if (videoCodec !== 'h264' || audioCodecs.some((codec) => codec !== 'aac')) {
+      const audioText = audioCodecs.length > 0 ? audioCodecs.join(', ') : '无音轨';
+      throw new Error(
+        `检测到视频编码 ${videoCodec || '未知'}、音频编码 ${audioText}，不能保证手机和电脑浏览器播放。原缓存仍保留，可在 MoonTVPlus 内播放`
+      );
+    }
+  }
+
+  private parseFfprobeHexDump(dump: string): Buffer {
+    const bytes: number[] = [];
+    for (const line of dump.split(/\r?\n/)) {
+      const hexColumn = line.replace(/^\s*[0-9a-f]+:\s*/i, '').split(/\s{2,}/, 1)[0];
+      for (const group of hexColumn.trim().split(/\s+/)) {
+        if (!/^[0-9a-f]+$/i.test(group) || group.length % 2 !== 0) continue;
+        for (let offset = 0; offset < group.length; offset += 2) {
+          bytes.push(parseInt(group.slice(offset, offset + 2), 16));
+        }
+      }
+    }
+    if (bytes.length === 0) throw new Error('无法读取 MP4 的 H.264 avcC 配置');
+    return Buffer.from(bytes);
+  }
+
+  private async scanVideoPackets(
+    inputPath: string,
+    taskId: string,
+    signal: AbortSignal,
+    avcConfiguration: ReturnType<typeof parseAvcDecoderConfiguration>,
+    fileSize: number,
+    onComplete: (
+      boundaries: HlsBoundary[],
+      firstKeyframePts: number,
+      packetCount: number
+    ) => Promise<void>
+  ): Promise<void> {
+    const fileHandle = await fs.promises.open(inputPath, 'r');
+    const parameterState = {
+      sps: new Map(avcConfiguration.sps),
+      pps: new Map(avcConfiguration.pps),
+    };
+    let packetIndex = 0;
+    let previousKeyframe: VideoPacket | undefined;
+    let activePpsId: number | undefined;
+    let firstKeyframePts: number | undefined;
+    let segmentStartPts: number | undefined;
+    let changedParametersPending = false;
+    let previousBoundaryFrame = -1;
+    const boundaries: HlsBoundary[] = [];
+    let packetBuffer = Buffer.allocUnsafe(256 * 1024);
+
+    try {
+      await this.runProcessLines('ffprobe', taskId, [
+        '-v', 'error',
+        '-select_streams', 'v:0',
+        '-show_packets',
+        '-show_entries', 'packet=pts_time,pos,size,flags',
+        '-of', 'compact=p=0:nk=0',
+        inputPath,
+      ], signal, async (line) => {
+        if (!line) return;
+        const values = new Map(line.split('|').map((field) => {
+          const divider = field.indexOf('=');
+          return divider < 0 ? [field, ''] : [field.slice(0, divider), field.slice(divider + 1)];
+        }));
+        const pts = Number(values.get('pts_time'));
+        const size = Number(values.get('size'));
+        const position = Number(values.get('pos'));
+        const flags = values.get('flags') || '';
+        if (!Number.isFinite(pts) || !Number.isInteger(size) || size <= 0 || !Number.isInteger(position)) {
+          throw new Error('FFprobe 返回了无效的视频包位置或时间戳');
+        }
+        if (position < 0 || position + size > fileSize || size > 32 * 1024 * 1024) {
+          throw new Error('FFprobe 返回的视频包超出 MP4 文件范围');
+        }
+        if (packetBuffer.length < size) packetBuffer = Buffer.allocUnsafe(size);
+        const { bytesRead } = await fileHandle.read(packetBuffer, 0, size, position);
+        if (bytesRead !== size) throw new Error('无法完整读取 MP4 视频包');
+        const packetBytes = packetBuffer.subarray(0, size);
+        if (updateH264ParameterSets(packetBytes, avcConfiguration.nalLengthSize, parameterState)) {
+          changedParametersPending = true;
+        }
+
+        const keyframe = flags.includes('K');
+        const isIdr = keyframe && hasH264Idr(packetBytes, avcConfiguration.nalLengthSize);
+        const slicePpsIds = keyframe
+          ? getH264SlicePpsIds(packetBytes, avcConfiguration.nalLengthSize)
+          : [];
+        const packet: VideoPacket = {
+          index: packetIndex,
+          pts,
+          keyframe,
+          idr: isIdr,
+        };
+        packetIndex++;
+        if (!packet.idr) {
+          if (packet.keyframe) previousKeyframe = packet;
+          return;
+        }
+
+        const currentPpsId = slicePpsIds[0];
+        if (currentPpsId !== undefined && activePpsId !== undefined && currentPpsId !== activePpsId) {
+          changedParametersPending = true;
+        }
+        if (currentPpsId !== undefined) activePpsId = currentPpsId;
+
+        if (!previousKeyframe) {
+          if (packet.index !== 0) throw new Error('MP4 视频不是从 IDR 关键帧开始，无法安全切分');
+          firstKeyframePts = packet.pts;
+          segmentStartPts = packet.pts;
+          previousKeyframe = packet;
+          changedParametersPending = false;
+          return;
+        }
+
+        const discontinuity = changedParametersPending;
+        const reachedDuration = packet.pts - (segmentStartPts ?? packet.pts) >= 6;
+        if (discontinuity || reachedDuration) {
+          const frameThreshold = Math.floor((previousKeyframe.index + packet.index) / 2);
+          if (frameThreshold <= previousBoundaryFrame || frameThreshold >= packet.index) {
+            throw new Error('关键帧间距过短，无法生成稳定的 HLS 分片边界');
+          }
+          boundaries.push({ frame: frameThreshold, pts: packet.pts, discontinuity });
+          previousBoundaryFrame = frameThreshold;
+          segmentStartPts = packet.pts;
+          changedParametersPending = false;
+        }
+        previousKeyframe = packet;
+      });
+
+      if (!previousKeyframe || firstKeyframePts === undefined) {
+        throw new Error('MP4 中未找到可用于切分的 H.264 关键帧');
+      }
+      await onComplete(boundaries, firstKeyframePts, packetIndex);
+    } finally {
+      await fileHandle.close();
+    }
+  }
+
+  private async runProcessLines(
+    command: string,
+    taskId: string,
+    args: string[],
+    signal: AbortSignal,
+    onLine: (line: string) => Promise<void>
+  ): Promise<void> {
+    this.throwIfAborted(signal);
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    this.childProcesses.set(taskId, child);
+    let stderr = '';
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      stderr = (stderr + chunk.toString()).slice(-32 * 1024);
+    });
+    let processError: Error | undefined;
+    child.once('error', (error) => {
+      processError = error;
+    });
+    const closed = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once('close', (code, childSignal) => resolve({ code, signal: childSignal }));
+    });
+    const abortProcess = () => {
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      child.kill('SIGTERM');
+      const killTimeout = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+      }, 5000);
+      killTimeout.unref();
+    };
+    signal.addEventListener('abort', abortProcess, { once: true });
+    const lines = createInterface({ input: child.stdout, crlfDelay: Infinity });
+    try {
+      for await (const line of lines) {
+        this.throwIfAborted(signal);
+        await onLine(line);
+      }
+      const result = await closed;
+      if (signal.aborted) throw new Error('任务已取消');
+      if (processError) throw processError;
+      if (result.code !== 0) {
+        throw new Error(stderr.trim().slice(-4000) || `${command} exited with ${result.signal || result.code}`);
+      }
+    } catch (error) {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGTERM');
+      await Promise.race([
+        closed,
+        new Promise<void>((resolve) => {
+          const timeout = setTimeout(() => {
+            if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+            resolve();
+          }, 5000);
+          timeout.unref();
+        }),
+      ]);
+      if (signal.aborted) throw new Error('任务已取消');
+      throw error;
+    } finally {
+      lines.close();
+      signal.removeEventListener('abort', abortProcess);
+      this.childProcesses.delete(taskId);
+    }
+  }
+
+  private readSegmentList(csvPath: string): SegmentListEntry[] {
+    const rows = fs.readFileSync(csvPath, 'utf-8').split(/\r?\n/).filter(Boolean);
+    return rows.map((row) => {
+      const match = row.match(/^(.*),(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)$/);
+      if (!match) throw new Error('FFmpeg 未能生成有效的 HLS 分片清单');
+      const filename = path.basename(match[1].replace(/^"|"$/g, ''));
+      if (!/^segment_\d{5}\.ts$/.test(filename)) {
+        throw new Error('FFmpeg 生成了无效的 HLS 分片名称');
+      }
+      return { filename, start: Number(match[2]), end: Number(match[3]) };
+    });
+  }
+
+  private validateSegmentList(
+    entries: SegmentListEntry[],
+    boundaries: HlsBoundary[],
+    firstKeyframePts: number,
+    directory: string
+  ): void {
+    if (entries.length !== boundaries.length + 1) {
+      throw new Error('FFmpeg 输出的 HLS 分片数量与预期关键帧切点不一致');
+    }
+    let previousEnd = Number.NEGATIVE_INFINITY;
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index];
+      if (entry.start < previousEnd - 0.5 || entry.end <= entry.start) {
+        throw new Error('FFmpeg 输出的 HLS 分片时间范围无效');
+      }
+      previousEnd = entry.end;
+      if (index > 0) {
+        const expectedStart = boundaries[index - 1].pts - firstKeyframePts;
+        if (Math.abs(entry.start - expectedStart) > 0.75) {
+          throw new Error('FFmpeg 实际切点未落在预期关键帧，已取消发布');
+        }
+      }
+      const segmentPath = path.join(directory, entry.filename);
+      const stats = fs.statSync(segmentPath);
+      if (!stats.isFile() || stats.size < 188) throw new Error(`HLS 分片缺失或为空：${entry.filename}`);
+      const firstByte = Buffer.alloc(1);
+      const fd = fs.openSync(segmentPath, 'r');
+      try {
+        fs.readSync(fd, firstByte, 0, 1, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (firstByte[0] !== 0x47) throw new Error(`HLS 分片不是有效的 MPEG-TS：${entry.filename}`);
+    }
+    const listedSegments = fs.readdirSync(directory).filter((name) => /^segment_\d{5}\.ts$/.test(name));
+    if (listedSegments.length !== entries.length) throw new Error('FFmpeg 输出的 HLS 分片数量校验失败');
+  }
+
+  private createPublishedPlaylist(entries: SegmentListEntry[], boundaries: HlsBoundary[]): string {
+    const maxDuration = Math.max(...entries.map((entry) => entry.end - entry.start));
+    const lines = [
+      '#EXTM3U',
+      '#EXT-X-VERSION:3',
+      `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(maxDuration))}`,
+      '#EXT-X-MEDIA-SEQUENCE:0',
+      '#EXT-X-PLAYLIST-TYPE:VOD',
+      '#EXT-X-INDEPENDENT-SEGMENTS',
+    ];
+    for (let index = 0; index < entries.length; index++) {
+      if (index > 0 && boundaries[index - 1]?.discontinuity) {
+        lines.push('#EXT-X-DISCONTINUITY');
+      }
+      const duration = entries[index].end - entries[index].start;
+      lines.push(`#EXTINF:${duration.toFixed(3)},`, entries[index].filename);
+    }
+    lines.push('#EXT-X-ENDLIST');
+    return `${lines.join('\n')}\n`;
+  }
+
+  private validatePlaybackId(playbackId: string): string {
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playbackId)) {
+      throw new Error('缓存链接标识无效');
+    }
+    return playbackId.toLowerCase();
+  }
+
+  private getPublishedHlsRoot(): string {
+    if (!this.exportDir) throw new Error('HLS 兼容播放发布目录未配置');
+    return path.resolve(this.exportDir, 'hls');
+  }
+
+  private getPublishedHlsDirectory(playbackId: string): string {
+    const canonicalId = this.validatePlaybackId(playbackId);
+    const root = this.getPublishedHlsRoot();
+    const directory = path.resolve(root, canonicalId);
+    if (path.dirname(directory) !== root) throw new Error('HLS 兼容播放路径无效');
+    return directory;
+  }
+
+  private getLegacyMp4Path(playbackId: string): string {
+    if (!this.exportDir) throw new Error('HLS 兼容播放发布目录未配置');
+    const canonicalId = this.validatePlaybackId(playbackId);
+    const filePath = path.resolve(this.exportDir, `${canonicalId}.mp4`);
+    if (path.dirname(filePath) !== this.exportDir) throw new Error('历史 MP4 路径无效');
+    return filePath;
+  }
+
+  private assertTaskDownloadDirectory(task: OfflineDownloadTask): void {
+    const expectedDirectory = this.getDownloadDirectory(task.source, task.videoId, task.episodeIndex);
+    if (path.resolve(task.downloadDir) !== expectedDirectory) {
+      throw new Error('下载目录路径与任务不匹配，拒绝生成公开播放页');
+    }
+  }
+
+  private isPublishedHlsReady(directory: string): boolean {
+    try {
+      const playlistPath = path.join(directory, 'index.m3u8');
+      const content = fs.readFileSync(playlistPath, 'utf-8');
+      const lines = content.split(/\r?\n/).map((line) => line.trim());
+      if (lines[0] !== '#EXTM3U' || !lines.includes('#EXT-X-ENDLIST')) return false;
+      const referencedFiles = lines.filter((line) => line && !line.startsWith('#'));
+      if (referencedFiles.length === 0) return false;
+
+      for (const filename of referencedFiles) {
+        if (!/^segment_\d{5}\.ts$/.test(filename) || path.basename(filename) !== filename) return false;
+        const filePath = path.resolve(directory, filename);
+        if (path.dirname(filePath) !== path.resolve(directory)) return false;
+        const stats = fs.statSync(filePath);
+        if (!stats.isFile() || stats.size < 188) return false;
+      }
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   getOrCreatePlaybackId(task: OfflineDownloadTask): string {
@@ -662,6 +1177,7 @@ export class OfflineDownloader {
   }
 
   requestCancel(taskId: string): void {
+    this.publicationControllers.get(taskId)?.abort();
     const child = this.childProcesses.get(taskId);
     if (child && child.exitCode === null && child.signalCode === null) {
       child.kill('SIGTERM');
@@ -779,15 +1295,6 @@ export class OfflineDownloader {
     if (duration) throw new Error('本地播放列表最后一个视频分片不完整');
     remuxLines.push('#EXT-X-ENDLIST');
     return remuxLines;
-  }
-
-  private getPublishedPath(playbackId: string): string {
-    if (!this.exportDir || !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(playbackId)) {
-      throw new Error('缓存链接标识无效');
-    }
-    const filePath = path.resolve(this.exportDir, `${playbackId}.mp4`);
-    if (path.dirname(filePath) !== this.exportDir) throw new Error('缓存链接路径无效');
-    return filePath;
   }
 
   private async runProcess(command: string, taskId: string, args: string[], signal?: AbortSignal): Promise<string> {
@@ -990,14 +1497,40 @@ export class OfflineDownloader {
   async deleteTask(task: OfflineDownloadTask): Promise<void> {
     const expectedDownloadDir = this.getDownloadDirectory(task.source, task.videoId, task.episodeIndex);
     if (path.resolve(task.downloadDir) !== expectedDownloadDir) throw new Error('下载目录路径与任务不匹配，拒绝删除');
+    const playbackId = task.playbackId ? this.validatePlaybackId(task.playbackId) : undefined;
+    this.requestCancel(task.id);
+    const activePublication = this.publicationOperations.get(task.id);
+    if (activePublication) {
+      try {
+        await activePublication;
+      } catch {
+        // Cancellation is expected while deleting an active publication.
+      }
+    }
     await fs.promises.rm(expectedDownloadDir, { recursive: true, force: true });
-    if (this.exportDir && task.playbackId) {
-      if (fs.existsSync(this.exportDir)) {
-        await fs.promises.rm(this.getPublishedPath(task.playbackId), { force: true });
-        for (const entry of await fs.promises.readdir(this.exportDir, { withFileTypes: true })) {
-          if (entry.isFile() && entry.name.startsWith(`.${task.playbackId}.`) && entry.name.endsWith('.part.mp4')) {
-            await fs.promises.rm(path.join(this.exportDir, entry.name), { force: true });
+    if (this.exportDir && playbackId && fs.existsSync(this.exportDir)) {
+      await fs.promises.rm(this.getLegacyMp4Path(playbackId), { force: true });
+      await fs.promises.rm(this.getPublishedHlsDirectory(playbackId), { recursive: true, force: true });
+      this.validatedPublishedIds.delete(playbackId);
+
+      const hlsRoot = this.getPublishedHlsRoot();
+      if (fs.existsSync(hlsRoot)) {
+        for (const entry of await fs.promises.readdir(hlsRoot, { withFileTypes: true })) {
+          if (
+            entry.isDirectory() &&
+            new RegExp(`^\\.${playbackId}\\.[0-9a-f-]+\\.tmp$`, 'i').test(entry.name)
+          ) {
+            await fs.promises.rm(path.join(hlsRoot, entry.name), { recursive: true, force: true });
           }
+        }
+      }
+
+      for (const entry of await fs.promises.readdir(this.exportDir, { withFileTypes: true })) {
+        if (!entry.isFile()) continue;
+        const isCurrentStage = new RegExp(`^\\.${playbackId}\\.[0-9a-f-]+\\.stage\\.mp4$`, 'i').test(entry.name);
+        const isLegacyPart = new RegExp(`^\\.${playbackId}\\.[0-9a-f-]+\\.part\\.mp4$`, 'i').test(entry.name);
+        if (isCurrentStage || isLegacyPart) {
+          await fs.promises.rm(path.join(this.exportDir, entry.name), { force: true });
         }
       }
     }

@@ -28,6 +28,9 @@ ENV DOCKER_ENV=true
 # 生成生产构建
 RUN pnpm run build
 
+# 将锁定依赖中的 HLS.js 作为同源静态资源随镜像发布
+RUN cp node_modules/hls.js/dist/hls.min.js public/hls.min.js
+
 # 使用 pnpm deploy 提取生产依赖到独立目录
 RUN pnpm deploy --filter=. --prod --legacy /tmp/prod-deps
 

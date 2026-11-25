@@ -23,6 +23,8 @@ Object.assign(globalThis, {
 });
 
 const mockPublishedIds = new Set<string>();
+const mockLegacyMp4Ids = new Set<string>();
+const mockLocalHlsKeys = new Set<string>();
 const mockWork = new Map<string, { finish: () => void; fail: (error: Error) => void }>();
 const mockStartedTasks: string[] = [];
 const mockDeletedDirectories: string[] = [];
@@ -38,8 +40,11 @@ const mockDownloader = {
   }),
   getPlaybackUrl: jest.fn((task: { playbackId?: string }) =>
     task.playbackId && mockPublishedIds.has(task.playbackId)
-      ? `/media/${task.playbackId}.mp4`
+      ? `/media/compat/${task.playbackId.toLowerCase()}`
       : undefined
+  ),
+  hasLegacyMp4: jest.fn((task: { playbackId?: string }) =>
+    Boolean(task.playbackId && mockLegacyMp4Ids.has(task.playbackId))
   ),
   createTask: jest.fn((source: string, videoId: string, episodeIndex: number, title: string, m3u8Url: string) => ({
     id: `${source}_${videoId}_${episodeIndex}`,
@@ -56,7 +61,9 @@ const mockDownloader = {
     updatedAt: new Date(),
     downloadDir: path.join(process.env.OFFLINE_DOWNLOAD_DIR || '', source, videoId, `ep${episodeIndex + 1}`),
   })),
-  checkDownloaded: jest.fn(() => false),
+  checkDownloaded: jest.fn((source: string, videoId: string, episodeIndex: number) =>
+    mockLocalHlsKeys.has(`${source}/${videoId}/${episodeIndex}`)
+  ),
   startDownload: jest.fn((
     task: { id: string; status: string; totalSegments: number; downloadedSegments: number },
     onProgress: (task: unknown) => void,
@@ -84,13 +91,23 @@ const mockDownloader = {
       mockWork.set(task.id, { finish, fail });
     });
   }),
-  remuxToMp4: jest.fn(async (task: { playbackId?: string }) => {
+  publishHls: jest.fn(async (task: { playbackId?: string }) => {
     if (task.playbackId) mockPublishedIds.add(task.playbackId);
   }),
   requestCancel: jest.fn(),
-  deleteTask: jest.fn(async (task: { downloadDir: string; playbackId?: string }) => {
+  deleteTask: jest.fn(async (task: {
+    downloadDir: string;
+    playbackId?: string;
+    source: string;
+    videoId: string;
+    episodeIndex: number;
+  }) => {
     mockDeletedDirectories.push(task.downloadDir);
-    if (task.playbackId) mockPublishedIds.delete(task.playbackId);
+    if (task.playbackId) {
+      mockPublishedIds.delete(task.playbackId);
+      mockLegacyMp4Ids.delete(task.playbackId);
+    }
+    mockLocalHlsKeys.delete(`${task.source}/${task.videoId}/${task.episodeIndex}`);
   }),
 };
 
@@ -152,6 +169,8 @@ describe('offline-download server cache queue', () => {
     temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'moontv-offline-route-'));
     process.env.OFFLINE_DOWNLOAD_DIR = temporaryRoot;
     mockPublishedIds.clear();
+    mockLegacyMp4Ids.clear();
+    mockLocalHlsKeys.clear();
     mockWork.clear();
     mockStartedTasks.length = 0;
     mockDeletedDirectories.length = 0;
@@ -159,15 +178,20 @@ describe('offline-download server cache queue', () => {
     mockDownloader.getDownloadDirectory.mockClear();
     mockDownloader.getOrCreatePlaybackId.mockClear();
     mockDownloader.getPlaybackUrl.mockClear();
+    mockDownloader.hasLegacyMp4.mockClear();
     mockDownloader.checkDownloaded.mockClear();
     mockDownloader.createTask.mockClear();
     mockDownloader.startDownload.mockClear();
-    mockDownloader.remuxToMp4.mockClear();
+    mockDownloader.publishHls.mockClear();
     mockDownloader.requestCancel.mockClear();
     mockDownloader.deleteTask.mockClear();
     mockDownloader.deleteTask.mockImplementation(async (task) => {
       mockDeletedDirectories.push(task.downloadDir);
-      if (task.playbackId) mockPublishedIds.delete(task.playbackId);
+      if (task.playbackId) {
+        mockPublishedIds.delete(task.playbackId);
+        mockLegacyMp4Ids.delete(task.playbackId);
+      }
+      mockLocalHlsKeys.delete(`${task.source}/${task.videoId}/${task.episodeIndex}`);
     });
     mockDownloader.startDownload.mockImplementation((task, onProgress, signal, shouldExport) => {
       mockStartedTasks.push(task.id);
@@ -179,6 +203,7 @@ describe('offline-download server cache queue', () => {
         const finish = () => {
           task.downloadedSegments = 2;
           task.status = shouldExport ? 'remuxing' : 'completed';
+          mockLocalHlsKeys.add(`${task.id.split('_')[0]}/${task.id.split('_')[1]}/${Number(task.id.split('_')[2])}`);
           onProgress(task);
           resolve();
         };
@@ -196,7 +221,7 @@ describe('offline-download server cache queue', () => {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   });
 
-  it('queues jobs sequentially and persists playback links after remux', async () => {
+  it('queues jobs sequentially and publishes HLS compatibility pages', async () => {
     const firstResponse = await postTask('episode-a');
     const secondResponse = await postTask('episode-b');
     expect(firstResponse.status).toBe(202);
@@ -211,7 +236,7 @@ describe('offline-download server cache queue', () => {
     await waitFor(async () => (await readTasks()).every((task) => task.status === 'completed'));
 
     const saved = await readTasks();
-    expect(saved.every((task) => task.playbackUrl?.startsWith('/media/'))).toBe(true);
+    expect(saved.every((task) => task.playbackUrl?.startsWith('/media/compat/'))).toBe(true);
     expect(mockStartedTasks).toEqual(['ffzyapi.com_episode-a_0', 'ffzyapi.com_episode-b_0']);
 
     const persisted = JSON.parse(fs.readFileSync(path.join(temporaryRoot, 'tasks.json'), 'utf-8'));
@@ -230,6 +255,22 @@ describe('offline-download server cache queue', () => {
     expect(responses.map((response) => response.status)).toEqual([202, 202]);
     expect(mockDownloader.createTask).toHaveBeenCalledTimes(1);
     expect((await readTasks())).toHaveLength(1);
+  });
+
+  it('keeps download-only behavior when playback export is not configured', async () => {
+    delete process.env.OFFLINE_DOWNLOAD_EXPORT_DIR;
+    jest.resetModules();
+    route = await import('./route');
+
+    const response = await postTask('download-only');
+    expect(response.status).toBe(202);
+    await waitFor(() => mockStartedTasks.length === 1);
+    expect(mockDownloader.startDownload.mock.calls[0]?.[3]).toBe(false);
+    mockWork.get('ffzyapi.com_download-only_0')?.finish();
+    await waitFor(async () => (await readTasks())[0]?.status === 'completed');
+
+    expect((await readTasks())[0]?.playbackUrl).toBeUndefined();
+    expect(mockDownloader.publishHls).not.toHaveBeenCalled();
   });
 
   it('waits for an active task to stop before removing its HLS and MP4 files', async () => {
@@ -264,7 +305,7 @@ describe('offline-download server cache queue', () => {
     expect(remaining.playbackUrl).toBeTruthy();
   });
 
-  it('remuxes an existing completed HLS task when its generated playback file is missing', async () => {
+  it('re-publishes an existing completed HLS cache without downloading the source again', async () => {
     const response = await postTask('retry-remux');
     expect(response.status).toBe(202);
     await waitFor(() => mockStartedTasks.length === 1);
@@ -277,12 +318,203 @@ describe('offline-download server cache queue', () => {
 
     const retry = await route.PUT(makeRequest('/api/offline-download?taskId=ffzyapi.com_retry-remux_0&action=retry', 'PUT'));
     expect(retry.status).toBe(202);
-    await waitFor(() => mockStartedTasks.length === 2);
-    mockWork.get('ffzyapi.com_retry-remux_0')?.finish();
-    await waitFor(() => mockPublishedIds.has(playbackId));
+    await waitFor(async () => {
+      const [task] = await readTasks();
+      return task?.status === 'completed' || task?.status === 'error';
+    });
     const [retried] = await readTasks();
     expect(completed.status).toBe('completed');
     expect(retried.status).toBe('completed');
     expect(retried.playbackUrl).toContain(playbackId);
+    expect(mockStartedTasks).toEqual(['ffzyapi.com_retry-remux_0']);
+    expect(mockDownloader.publishHls).toHaveBeenCalledTimes(2);
+  });
+
+  it('removes a published HLS page and task record on deletion', async () => {
+    const response = await postTask('delete-published');
+    expect(response.status).toBe(202);
+    await waitFor(() => mockStartedTasks.length === 1);
+    mockWork.get('ffzyapi.com_delete-published_0')?.finish();
+    await waitFor(() => mockPublishedIds.size === 1);
+
+    const persisted = JSON.parse(fs.readFileSync(path.join(temporaryRoot, 'tasks.json'), 'utf-8'));
+    const [storedTask] = persisted as { id: string; playbackId: string }[];
+    expect(storedTask.playbackId).toBeTruthy();
+    const deletion = await route.DELETE(makeRequest(`/api/offline-download?taskId=${storedTask.id}`, 'DELETE'));
+
+    expect(deletion.status).toBe(200);
+    expect(mockPublishedIds.has(storedTask.playbackId)).toBe(false);
+    expect(mockLocalHlsKeys.has('ffzyapi.com/delete-published/0')).toBe(false);
+    expect(await readTasks()).toEqual([]);
+  });
+
+  it('backfills a legacy MP4 task on startup without requesting the source', async () => {
+    const playbackId = '00000000-0000-4000-8000-000000000101';
+    mockLegacyMp4Ids.add(playbackId);
+    fs.writeFileSync(path.join(temporaryRoot, 'tasks.json'), JSON.stringify([{
+      id: 'legacy_mp4_task',
+      source: 'ffzyapi.com',
+      videoId: 'legacy-mp4',
+      episodeIndex: 0,
+      title: '旧 MP4 缓存',
+      m3u8Url: 'https://stream.example/legacy/playlist.m3u8',
+      status: 'completed',
+      progress: 100,
+      totalSegments: 2,
+      downloadedSegments: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadDir: path.join(temporaryRoot, 'ffzyapi.com', 'legacy-mp4', 'ep1'),
+      playbackId,
+    }]));
+    jest.resetModules();
+    route = await import('./route');
+
+    await waitFor(async () => {
+      const [task] = await readTasks();
+      return task?.status === 'completed' || task?.status === 'error';
+    });
+    const [task] = await readTasks();
+    expect(task.status).toBe('completed');
+    expect(task.playbackUrl).toBe(`/media/compat/${playbackId}`);
+    expect(mockDownloader.publishHls).toHaveBeenCalledTimes(1);
+    expect(mockDownloader.startDownload).not.toHaveBeenCalled();
+  });
+
+  it('backfills a complete private HLS cache on startup without requesting the source', async () => {
+    const playbackId = '00000000-0000-4000-8000-000000000102';
+    mockLocalHlsKeys.add('ffzyapi.com/legacy-hls/0');
+    fs.writeFileSync(path.join(temporaryRoot, 'tasks.json'), JSON.stringify([{
+      id: 'legacy_hls_task',
+      source: 'ffzyapi.com',
+      videoId: 'legacy-hls',
+      episodeIndex: 0,
+      title: '旧 HLS 缓存',
+      m3u8Url: 'https://stream.example/legacy-hls/playlist.m3u8',
+      status: 'completed',
+      progress: 100,
+      totalSegments: 2,
+      downloadedSegments: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadDir: path.join(temporaryRoot, 'ffzyapi.com', 'legacy-hls', 'ep1'),
+      playbackId,
+    }]));
+    jest.resetModules();
+    route = await import('./route');
+
+    await waitFor(async () => {
+      const [task] = await readTasks();
+      return task?.status === 'completed' || task?.status === 'error';
+    });
+    const [task] = await readTasks();
+    expect(task.status).toBe('completed');
+    expect(task.playbackUrl).toBe(`/media/compat/${playbackId}`);
+    expect(mockDownloader.publishHls).toHaveBeenCalledTimes(1);
+    expect(mockDownloader.startDownload).not.toHaveBeenCalled();
+  });
+
+  it('restores an already-published HLS task as completed without re-queueing it', async () => {
+    const playbackId = '00000000-0000-4000-8000-000000000104';
+    mockPublishedIds.add(playbackId);
+    fs.writeFileSync(path.join(temporaryRoot, 'tasks.json'), JSON.stringify([{
+      id: 'ready_hls_task',
+      source: 'ffzyapi.com',
+      videoId: 'ready-hls',
+      episodeIndex: 0,
+      title: '已发布 HLS 缓存',
+      m3u8Url: 'https://stream.example/ready-hls/playlist.m3u8',
+      status: 'remuxing',
+      progress: 100,
+      totalSegments: 2,
+      downloadedSegments: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadDir: path.join(temporaryRoot, 'ffzyapi.com', 'ready-hls', 'ep1'),
+      playbackId,
+    }]));
+    jest.resetModules();
+    route = await import('./route');
+
+    const [task] = await readTasks();
+    expect(task.status).toBe('completed');
+    expect(task.playbackUrl).toBe(`/media/compat/${playbackId}`);
+    expect(mockDownloader.publishHls).not.toHaveBeenCalled();
+    expect(mockDownloader.startDownload).not.toHaveBeenCalled();
+  });
+
+  it('preserves an existing error even when its published HLS page is still available', async () => {
+    const playbackId = '00000000-0000-4000-8000-000000000105';
+    mockPublishedIds.add(playbackId);
+    fs.writeFileSync(path.join(temporaryRoot, 'tasks.json'), JSON.stringify([{
+      id: 'failed_delete_task',
+      source: 'ffzyapi.com',
+      videoId: 'failed-delete',
+      episodeIndex: 0,
+      title: '删除失败任务',
+      m3u8Url: 'https://stream.example/failed-delete/playlist.m3u8',
+      status: 'error',
+      progress: 100,
+      totalSegments: 2,
+      downloadedSegments: 2,
+      errorMessage: '删除缓存失败：文件系统只读',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadDir: path.join(temporaryRoot, 'ffzyapi.com', 'failed-delete', 'ep1'),
+      playbackId,
+    }]));
+    jest.resetModules();
+    route = await import('./route');
+
+    const [task] = await readTasks();
+    expect(task.status).toBe('error');
+    expect(task.errorMessage).toContain('文件系统只读');
+    expect(task.playbackUrl).toBe(`/media/compat/${playbackId}`);
+    expect(mockDownloader.publishHls).not.toHaveBeenCalled();
+    expect(mockDownloader.startDownload).not.toHaveBeenCalled();
+  });
+
+  it('keeps a failed startup backfill retryable and retries without requesting the source', async () => {
+    const playbackId = '00000000-0000-4000-8000-000000000103';
+    mockLegacyMp4Ids.add(playbackId);
+    mockDownloader.publishHls.mockRejectedValueOnce(new Error('发布目录暂不可写'));
+    fs.writeFileSync(path.join(temporaryRoot, 'tasks.json'), JSON.stringify([{
+      id: 'legacy_retry_task',
+      source: 'ffzyapi.com',
+      videoId: 'legacy-retry',
+      episodeIndex: 0,
+      title: '待重试旧缓存',
+      m3u8Url: 'https://stream.example/legacy-retry/playlist.m3u8',
+      status: 'completed',
+      progress: 100,
+      totalSegments: 2,
+      downloadedSegments: 2,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      downloadDir: path.join(temporaryRoot, 'ffzyapi.com', 'legacy-retry', 'ep1'),
+      playbackId,
+    }]));
+    jest.resetModules();
+    route = await import('./route');
+
+    const consoleError = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    try {
+      await waitFor(async () => (await readTasks())[0]?.status === 'error');
+      const [failed] = await readTasks();
+      expect(failed.errorMessage).toContain('HLS 兼容播放发布失败');
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    const retry = await route.PUT(makeRequest('/api/offline-download?taskId=legacy_retry_task&action=retry', 'PUT'));
+    expect(retry.status).toBe(202);
+    await waitFor(async () => {
+      const [task] = await readTasks();
+      return task?.status === 'completed' || task?.status === 'error';
+    });
+    const [task] = await readTasks();
+    expect(task.status).toBe('completed');
+    expect(task.playbackUrl).toBe(`/media/compat/${playbackId}`);
+    expect(mockDownloader.startDownload).not.toHaveBeenCalled();
   });
 });

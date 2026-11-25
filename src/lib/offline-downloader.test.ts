@@ -13,18 +13,38 @@ import { spawn } from 'child_process';
 import { OfflineDownloader, OfflineDownloadTask } from './offline-downloader';
 
 const mockSpawn = spawn as jest.MockedFunction<typeof spawn>;
-const H264_AAC = JSON.stringify({
-  streams: [
-    { codec_type: 'video', codec_name: 'h264' },
-    { codec_type: 'audio', codec_name: 'aac' },
-  ],
-});
+const UUID = '00000000-0000-4000-8000-000000000001';
+const EXTRADATA = '00000000: 0142 001e ffe1 0005 6742 001e 8001 0002 68c0';
 
-function makeChildProcess(
-  stdout: string,
-  closeCode: number | null = 0,
-  onRun?: () => void
-) {
+function makePacket(nals: Buffer[]): Buffer {
+  return Buffer.concat(nals.flatMap((nal) => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(nal.length);
+    return [length, nal];
+  }));
+}
+
+function makeInputPackets(includeSpsChange: boolean) {
+  const packets = [
+    makePacket([Buffer.from([0x65, 0xbc])]),
+    makePacket([Buffer.from([0x41, 0x80])]),
+    makePacket([
+      ...(includeSpsChange ? [Buffer.from([0x67, 0x4d, 0x00, 0x1e, 0x80])] : []),
+      Buffer.from([0x65, 0xbc]),
+    ]),
+    makePacket([Buffer.from([0x41, 0x80])]),
+    makePacket([Buffer.from([0x65, 0xbc])]),
+  ];
+  let position = 0;
+  const rows = packets.map((packet, index) => {
+    const row = `pts_time=${index}|size=${packet.length}|pos=${position}|flags=${index % 2 === 0 ? 'K_' : '__'}`;
+    position += packet.length;
+    return row;
+  });
+  return { data: Buffer.concat(packets), rows };
+}
+
+function makeChildProcess(stdout: string, closeCode: number | null = 0, onRun?: () => void) {
   const child = new EventEmitter() as EventEmitter & {
     stdout: PassThrough;
     stderr: PassThrough;
@@ -41,7 +61,7 @@ function makeChildProcess(
     setTimeout(() => child.emit('close', null, signal), 0);
     return true;
   });
-  if (onRun) onRun();
+  onRun?.();
   if (closeCode !== null) {
     setTimeout(() => {
       child.stdout.end(stdout);
@@ -53,25 +73,85 @@ function makeChildProcess(
   return child;
 }
 
-async function waitFor(condition: () => boolean) {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    if (condition()) return;
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  throw new Error('condition was not reached');
+function writeTsSegment(filePath: string) {
+  const segment = Buffer.alloc(188);
+  segment[0] = 0x47;
+  fs.writeFileSync(filePath, segment);
 }
 
-describe('OfflineDownloader MP4 export', () => {
+function configureSuccessfulPublish(options: { spsChange?: boolean; sourceCodec?: string } = {}) {
+  const packetData = makeInputPackets(options.spsChange ?? true);
+  const inputMp4 = packetData.data;
+  mockSpawn.mockImplementation((command, rawArgs) => {
+    const args = (rawArgs || []).map(String);
+    if (command === 'ffprobe') {
+      if (args.includes('-show_packets')) {
+        return makeChildProcess(`${packetData.rows.join('\n')}\n`) as unknown as ReturnType<typeof spawn>;
+      }
+      if (args.includes('-show_data')) {
+        return makeChildProcess(JSON.stringify({
+          streams: [
+            { codec_type: 'video', codec_name: 'h264', extradata: EXTRADATA },
+            { codec_type: 'audio', codec_name: 'aac' },
+          ],
+        })) as unknown as ReturnType<typeof spawn>;
+      }
+      return makeChildProcess(JSON.stringify({
+        streams: [
+          { codec_type: 'video', codec_name: options.sourceCodec || 'h264' },
+          { codec_type: 'audio', codec_name: 'aac' },
+        ],
+      })) as unknown as ReturnType<typeof spawn>;
+    }
+
+    expect(command).toBe('ffmpeg');
+    if (args.includes('mp4')) {
+      const inputIndex = args.indexOf('-i');
+      const playlistPath = args[inputIndex + 1];
+      const playlist = fs.readFileSync(playlistPath, 'utf-8');
+      expect(playlist).not.toContain('https://');
+      expect(playlist).not.toContain('#EXT-X-DEFINE');
+      expect(playlist).toContain('#EXT-X-KEY:METHOD=NONE');
+      const outputPath = args[args.length - 1];
+      fs.writeFileSync(outputPath, inputMp4);
+      return makeChildProcess('') as unknown as ReturnType<typeof spawn>;
+    }
+
+    expect(args).toContain('segment');
+    expect(args[args.indexOf('-reset_timestamps') + 1]).toBe('0');
+    const csvPath = args[args.indexOf('-segment_list') + 1];
+    const pattern = args[args.length - 1];
+    const outputDirectory = path.dirname(pattern);
+    const frameArgIndex = args.indexOf('-segment_frames');
+    const expectsBoundary = options.spsChange ?? true;
+    expect(frameArgIndex).toBeGreaterThan(-1);
+    if (!expectsBoundary) expect(args[frameArgIndex + 1]).toBe(String(packetData.rows.length + 1));
+
+    if (expectsBoundary) {
+      writeTsSegment(path.join(outputDirectory, 'segment_00000.ts'));
+      writeTsSegment(path.join(outputDirectory, 'segment_00001.ts'));
+      fs.writeFileSync(csvPath, 'segment_00000.ts,0.000000,2.000000\nsegment_00001.ts,2.000000,4.000000\n');
+    } else {
+      writeTsSegment(path.join(outputDirectory, 'segment_00000.ts'));
+      fs.writeFileSync(csvPath, 'segment_00000.ts,0.000000,4.000000\n');
+    }
+    return makeChildProcess('') as unknown as ReturnType<typeof spawn>;
+  });
+  return packetData;
+}
+
+describe('OfflineDownloader HLS publication', () => {
   let temporaryRoot: string;
   let downloadRoot: string;
   let exportRoot: string;
   let downloader: OfflineDownloader;
   let task: OfflineDownloadTask;
 
-  beforeEach(async () => {
-    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'moontv-offline-remux-'));
-    downloadRoot = path.join(temporaryRoot, 'hls');
+  beforeEach(() => {
+    temporaryRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'moontv-offline-hls-'));
+    downloadRoot = path.join(temporaryRoot, 'downloads');
     exportRoot = path.join(temporaryRoot, 'media');
+    fs.mkdirSync(exportRoot, { recursive: true });
     downloader = new OfflineDownloader(downloadRoot, undefined, exportRoot);
     task = downloader.createTask(
       'source.example',
@@ -80,8 +160,9 @@ describe('OfflineDownloader MP4 export', () => {
       '示例视频',
       'https://stream.example/playlist.m3u8'
     );
+    task.playbackId = UUID;
     fs.mkdirSync(task.downloadDir, { recursive: true });
-    fs.writeFileSync(path.join(task.downloadDir, 'segment_00000.ts'), Buffer.from('video segment'));
+    fs.writeFileSync(path.join(task.downloadDir, 'segment_00000.ts'), Buffer.from('source segment'));
     fs.writeFileSync(
       path.join(task.downloadDir, 'playlist.m3u8'),
       [
@@ -90,7 +171,7 @@ describe('OfflineDownloader MP4 export', () => {
         '#EXT-X-TARGETDURATION:5',
         '#EXT-X-DEFINE:QUERYPARAM="uri=https://outside.example/evil.ts"',
         '#EXT-X-KEY:METHOD=NONE,URI="https://outside.example/evil.key"',
-        '#EXTINF:4.8,Injected tag text is ignored',
+        '#EXTINF:4.8,ignored source metadata',
         'segment_00000.ts',
         '#EXT-X-ENDLIST',
       ].join('\n')
@@ -102,85 +183,102 @@ describe('OfflineDownloader MP4 export', () => {
     fs.rmSync(temporaryRoot, { recursive: true, force: true });
   });
 
-  it('builds a sanitized HLS playlist and atomically publishes an H.264 MP4 URL', async () => {
-    mockSpawn.mockImplementation((command, args) => {
-      if (command === 'ffprobe') {
-        const remuxPlaylist = fs.readFileSync(String(args?.[args.length - 1]), 'utf-8');
-        expect(remuxPlaylist).toContain('#EXTM3U');
-        expect(remuxPlaylist).toContain('#EXT-X-PLAYLIST-TYPE:VOD');
-        expect(remuxPlaylist).toContain('#EXT-X-KEY:METHOD=NONE');
-        expect(remuxPlaylist).toContain('segment_00000.ts');
-        expect(remuxPlaylist).not.toContain('https://');
-        expect(remuxPlaylist).not.toContain('#EXT-X-DEFINE');
-        expect(remuxPlaylist).not.toContain('Injected tag text');
-        return makeChildProcess(H264_AAC) as unknown as ReturnType<typeof spawn>;
-      }
+  it('sanitizes local HLS, segments SPS changes, and atomically publishes a ready URL', async () => {
+    configureSuccessfulPublish();
 
-      expect(command).toBe('ffmpeg');
-      expect(args).toContain('-c');
-      expect(args).toContain('copy');
-      expect(args).toContain('+faststart');
-      fs.writeFileSync(String(args?.[args.length - 1]), Buffer.from('mp4 output'));
-      return makeChildProcess('') as unknown as ReturnType<typeof spawn>;
-    });
+    await downloader.publishHls(task);
 
-    await downloader.remuxToMp4(task);
-
-    const url = downloader.getPlaybackUrl(task);
-    expect(url).toBe(`/media/${task.playbackId}.mp4`);
-    expect(fs.readFileSync(path.join(exportRoot, `${task.playbackId}.mp4`), 'utf-8')).toBe('mp4 output');
-    expect(fs.readdirSync(task.downloadDir)).not.toContain(`remux-${task.playbackId}.m3u8`);
-    expect(fs.readdirSync(exportRoot).every((filename) => filename.endsWith('.mp4'))).toBe(true);
+    const playlistPath = path.join(exportRoot, 'hls', UUID, 'index.m3u8');
+    const playlist = fs.readFileSync(playlistPath, 'utf-8');
+    expect(playlist).toContain('#EXT-X-DISCONTINUITY\n#EXTINF:2.000');
+    expect(playlist).toContain('#EXT-X-ENDLIST');
+    expect(downloader.getPlaybackUrl(task)).toBe(`/media/compat/${UUID}`);
+    expect(downloader.hasLegacyMp4(task)).toBe(false);
+    expect(fs.readdirSync(exportRoot).some((name) => name.endsWith('.stage.mp4'))).toBe(false);
   });
 
-  it('keeps the HLS files and rejects browser-incompatible codecs', async () => {
-    mockSpawn.mockImplementation((command) => {
-      expect(command).toBe('ffprobe');
-      return makeChildProcess(JSON.stringify({
-        streams: [{ codec_type: 'video', codec_name: 'hevc' }],
-      })) as unknown as ReturnType<typeof spawn>;
-    });
+  it('uses a legacy MP4 as the source and preserves it after HLS publication', async () => {
+    const packetData = configureSuccessfulPublish();
+    const legacyPath = path.join(exportRoot, `${UUID}.mp4`);
+    fs.writeFileSync(legacyPath, packetData.data);
 
-    await expect(downloader.remuxToMp4(task)).rejects.toThrow('检测到视频编码 hevc');
+    await downloader.publishHls(task);
+
+    expect(fs.readFileSync(legacyPath)).toEqual(packetData.data);
+    expect(downloader.getPlaybackUrl(task)).toBe(`/media/compat/${UUID}`);
+    expect(mockSpawn.mock.calls.some(([, args]) => (args as string[]).includes('-movflags'))).toBe(false);
+  });
+
+  it('enforces one segment for short inputs without parameter changes', async () => {
+    configureSuccessfulPublish({ spsChange: false });
+
+    await downloader.publishHls(task);
+
+    const directory = path.join(exportRoot, 'hls', UUID);
+    expect(fs.readdirSync(directory).filter((name) => name.endsWith('.ts'))).toEqual(['segment_00000.ts']);
+    expect(fs.readFileSync(path.join(directory, 'index.m3u8'), 'utf-8')).not.toContain('#EXT-X-DISCONTINUITY');
+  });
+
+  it('rejects unsupported codecs while retaining the original HLS cache', async () => {
+    configureSuccessfulPublish({ sourceCodec: 'hevc' });
+
+    await expect(downloader.publishHls(task)).rejects.toThrow('视频编码 hevc');
     expect(fs.existsSync(path.join(task.downloadDir, 'playlist.m3u8'))).toBe(true);
     expect(downloader.getPlaybackUrl(task)).toBeUndefined();
-    expect(fs.readdirSync(task.downloadDir)).not.toContain(`remux-${task.playbackId}.m3u8`);
   });
 
-  it('waits for the FFmpeg child process to stop when the task is cancelled', async () => {
-    let child: ReturnType<typeof makeChildProcess> | undefined;
-    mockSpawn.mockImplementation(() => {
-      child = makeChildProcess('', null);
+  it('waits for and cancels the active FFmpeg child before cleaning staging data', async () => {
+    const childProcesses: ReturnType<typeof makeChildProcess>[] = [];
+    mockSpawn.mockImplementation((command) => {
+      if (command === 'ffprobe') {
+        return makeChildProcess(JSON.stringify({
+          streams: [
+            { codec_type: 'video', codec_name: 'h264' },
+            { codec_type: 'audio', codec_name: 'aac' },
+          ],
+        })) as unknown as ReturnType<typeof spawn>;
+      }
+      expect(command).toBe('ffmpeg');
+      const child = makeChildProcess('', null);
+      childProcesses.push(child);
       return child as unknown as ReturnType<typeof spawn>;
     });
     const controller = new AbortController();
-
-    const exportPromise = downloader.remuxToMp4(task, controller.signal);
-    await waitFor(() => mockSpawn.mock.calls.length === 1);
+    const publishPromise = downloader.publishHls(task, controller.signal);
+    for (let attempt = 0; attempt < 50 && childProcesses.length === 0; attempt++) {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
     controller.abort();
 
-    await expect(exportPromise).rejects.toThrow('任务已取消');
-    expect(child?.kill).toHaveBeenCalledWith('SIGTERM');
-    expect(fs.readdirSync(exportRoot)).toEqual([]);
-    expect(fs.readdirSync(task.downloadDir)).not.toContain(`remux-${task.playbackId}.m3u8`);
+    await expect(publishPromise).rejects.toThrow('任务已取消');
+    expect(childProcesses[0].kill).toHaveBeenCalledWith('SIGTERM');
+    expect(fs.existsSync(path.join(exportRoot, 'hls', UUID))).toBe(false);
+    expect(fs.readdirSync(exportRoot)).toEqual(['hls']);
+    expect(fs.existsSync(path.join(task.downloadDir, 'playlist.m3u8'))).toBe(true);
   });
 
-  it('removes only the selected task output and tolerates a missing export directory', async () => {
-    task.playbackId = '00000000-0000-4000-8000-000000000001';
-    fs.mkdirSync(exportRoot, { recursive: true });
-    fs.writeFileSync(path.join(exportRoot, `${task.playbackId}.mp4`), 'selected');
-    fs.writeFileSync(path.join(exportRoot, 'another.mp4'), 'other task');
+  it('deletes private HLS, public HLS, legacy MP4, and only this task temp files', async () => {
+    const publicDirectory = path.join(exportRoot, 'hls', UUID);
+    const tempDirectory = path.join(exportRoot, 'hls', `.${UUID}.00000000-0000-4000-8000-000000000002.tmp`);
+    fs.mkdirSync(publicDirectory, { recursive: true });
+    fs.mkdirSync(tempDirectory, { recursive: true });
+    writeTsSegment(path.join(publicDirectory, 'segment_00000.ts'));
+    fs.writeFileSync(path.join(publicDirectory, 'index.m3u8'), '#EXTM3U\n#EXTINF:1,\nsegment_00000.ts\n#EXT-X-ENDLIST\n');
+    fs.writeFileSync(path.join(exportRoot, `${UUID}.mp4`), 'legacy');
+    fs.writeFileSync(path.join(exportRoot, `.${UUID}.00000000-0000-4000-8000-000000000003.stage.mp4`), 'stage');
+    fs.writeFileSync(path.join(exportRoot, '.another.mp4'), 'keep');
 
     await downloader.deleteTask(task);
 
     expect(fs.existsSync(task.downloadDir)).toBe(false);
-    expect(fs.readFileSync(path.join(exportRoot, 'another.mp4'), 'utf-8')).toBe('other task');
-    fs.rmSync(exportRoot, { recursive: true, force: true });
-    await expect(downloader.deleteTask(task)).resolves.toBeUndefined();
+    expect(fs.existsSync(publicDirectory)).toBe(false);
+    expect(fs.existsSync(tempDirectory)).toBe(false);
+    expect(fs.existsSync(path.join(exportRoot, `${UUID}.mp4`))).toBe(false);
+    expect(fs.existsSync(path.join(exportRoot, '.another.mp4'))).toBe(true);
   });
 
-  it('rejects task identifiers that escape the HLS storage directory', () => {
-    expect(() => downloader.getDownloadDirectory('../outside', 'episode', 0)).toThrow('视频源标识无效');
-    expect(() => downloader.getDownloadDirectory('source', '../outside', 0)).toThrow('视频标识无效');
+  it('rejects a task whose private path does not match its source identity', async () => {
+    task.downloadDir = path.join(temporaryRoot, 'outside');
+    await expect(downloader.deleteTask(task)).rejects.toThrow('下载目录路径与任务不匹配');
   });
 });

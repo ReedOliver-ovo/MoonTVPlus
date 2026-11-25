@@ -192,7 +192,7 @@ export function OfflineDownloadPanel({
       case 'downloading':
         return '下载中';
       case 'remuxing':
-        return '封装 MP4 中';
+        return '生成 HLS 播放页中';
       case 'paused':
         return '已暂停';
       case 'completed':
@@ -209,6 +209,7 @@ export function OfflineDownloadPanel({
       case 'pending':
         return 'text-gray-500 dark:text-gray-400';
       case 'downloading':
+      case 'remuxing':
         return 'text-blue-500 dark:text-blue-400';
       case 'paused':
         return 'text-yellow-500 dark:text-yellow-400';
@@ -223,7 +224,7 @@ export function OfflineDownloadPanel({
 
   const getTaskStatusText = (task: OfflineDownloadTask) => {
     if (task.status === 'completed') {
-      return task.playbackUrl ? '可播放' : '已下载，待生成 MP4';
+      return task.playbackUrl ? '可播放' : '下载完成（暂无播放页）';
     }
     return getStatusText(task.status);
   };
@@ -407,7 +408,7 @@ export function OfflineDownloadPanel({
                             <span>第{ep.episodeIndex + 1}集</span>
                             <span className={getStatusColor(ep.status)}>
                       {ep.status === 'completed' && !ep.playbackUrl
-                        ? '等待 MP4'
+                        ? '暂无播放页'
                         : getStatusText(ep.status)}
                             </span>
                             {ep.playbackUrl ? (
@@ -606,7 +607,7 @@ export function OfflineDownloadPanel({
                           d='M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15'
                         />
                       </svg>
-                      {task.status === 'completed' ? '生成 MP4' : '重试'}
+                      重试
                     </button>
                   )}
                   <button

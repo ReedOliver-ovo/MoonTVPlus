@@ -25,6 +25,7 @@ const tasks = new Map<string, OfflineDownloadTask>();
 const activeDownloads = new Map<string, Promise<void>>();
 const cancellationControllers = new Map<string, AbortController>();
 const deletingTasks = new Set<string>();
+const publicationQueue = new Set<string>();
 const TASKS_FILE = path.join(OFFLINE_DOWNLOAD_DIR, 'tasks.json');
 let queueRunner: Promise<void> | null = null;
 
@@ -53,8 +54,10 @@ function loadTasks(): void {
   if (!fs.existsSync(TASKS_FILE)) return;
 
   try {
+    const taskDownloader = getDownloader();
     const storedTasks = JSON.parse(fs.readFileSync(TASKS_FILE, 'utf-8'));
     if (!Array.isArray(storedTasks)) throw new Error('任务文件格式无效');
+    let changed = false;
 
     for (const taskData of storedTasks) {
       const episodeIndex = Number(taskData.episodeIndex);
@@ -93,21 +96,50 @@ function loadTasks(): void {
             : undefined,
       };
 
-      if (task.status === 'downloading' || task.status === 'pending') {
-        task.status = 'paused';
-        task.errorMessage = '服务器重启，任务已暂停';
-      } else if (task.status === 'remuxing') {
-        if (getDownloader().getPlaybackUrl(task)) {
+      if (
+        (task.status === 'completed' || task.status === 'remuxing') &&
+        taskDownloader.getPlaybackUrl(task)
+      ) {
+        if (task.status !== 'completed' || task.errorMessage) {
           task.status = 'completed';
           task.errorMessage = undefined;
-        } else {
-          task.status = 'paused';
-          task.errorMessage = '服务器重启，MP4 封装已暂停，请重试';
+          task.progress = 100;
+          task.updatedAt = new Date();
+          changed = true;
         }
+      } else if (task.status === 'downloading' || task.status === 'pending') {
+        task.status = 'paused';
+        task.errorMessage = '服务器重启，任务已暂停';
+        task.updatedAt = new Date();
+        changed = true;
+      } else if (
+        OFFLINE_DOWNLOAD_EXPORT_DIR &&
+        (task.status === 'completed' || task.status === 'remuxing')
+      ) {
+        if (hasReusableCache(task)) {
+          task.status = 'remuxing';
+          task.errorMessage = undefined;
+          task.updatedAt = new Date();
+          publicationQueue.add(task.id);
+        } else {
+          task.status = 'error';
+          task.errorMessage =
+            '未找到可复用的历史缓存文件，请重试以重新下载并生成播放页';
+          task.updatedAt = new Date();
+        }
+        changed = true;
+      } else if (task.status === 'remuxing') {
+        task.status = 'paused';
+        task.errorMessage = 'HLS 兼容播放发布目录未配置，请配置后重试';
+        task.updatedAt = new Date();
+        changed = true;
       }
 
       tasks.set(task.id, task);
     }
+
+    if (changed) saveTasks();
+    if (getNextQueuedTask()) scheduleQueuedTasks();
   } catch (error) {
     console.error('加载离线下载任务失败:', error);
   }
@@ -145,16 +177,37 @@ function serializeTask(task: OfflineDownloadTask) {
   };
 }
 
-function getNextQueuedTask(): OfflineDownloadTask | undefined {
-  return Array.from(tasks.values())
-    .filter(
-      (task) => task.status === 'pending' && !deletingTasks.has(task.id)
-    )
-    .sort(
-      (a, b) =>
-        a.createdAt.getTime() - b.createdAt.getTime() ||
-        a.id.localeCompare(b.id)
-    )[0];
+interface QueuedTask {
+  task: OfflineDownloadTask;
+  operation: 'download' | 'publish';
+}
+
+function getNextQueuedTask(): QueuedTask | undefined {
+  const queuedTasks: QueuedTask[] = [];
+  for (const task of Array.from(tasks.values())) {
+    if (deletingTasks.has(task.id)) continue;
+    if (task.status === 'pending') {
+      queuedTasks.push({ task, operation: 'download' });
+    } else if (task.status === 'remuxing' && publicationQueue.has(task.id)) {
+      queuedTasks.push({ task, operation: 'publish' });
+    }
+  }
+
+  return queuedTasks.sort(
+    (a, b) =>
+      a.task.createdAt.getTime() - b.task.createdAt.getTime() ||
+      a.task.id.localeCompare(b.task.id)
+  )[0];
+}
+
+function hasReusableCache(task: OfflineDownloadTask): boolean {
+  const taskDownloader = getDownloader();
+  return (
+    taskDownloader.hasLegacyMp4(task) ||
+    (task.totalSegments > 0 &&
+      task.downloadedSegments >= task.totalSegments &&
+      taskDownloader.checkDownloaded(task.source, task.videoId, task.episodeIndex))
+  );
 }
 
 function updateTask(task: OfflineDownloadTask): void {
@@ -165,28 +218,37 @@ function updateTask(task: OfflineDownloadTask): void {
 
 async function processTask(
   task: OfflineDownloadTask,
-  signal: AbortSignal
+  signal: AbortSignal,
+  operation: 'download' | 'publish' = 'download'
 ): Promise<void> {
   const taskDownloader = getDownloader();
-  const exportToMp4 = Boolean(OFFLINE_DOWNLOAD_EXPORT_DIR);
+  const publishPlayback = Boolean(OFFLINE_DOWNLOAD_EXPORT_DIR);
 
   try {
-    if (exportToMp4) taskDownloader.getOrCreatePlaybackId(task);
-    await taskDownloader.startDownload(
-      task,
-      updateTask,
-      signal,
-      exportToMp4
-    );
-    if (signal.aborted || deletingTasks.has(task.id)) return;
+    if (operation === 'publish' && !publishPlayback) {
+      throw new Error('HLS 兼容播放发布目录未配置');
+    }
+    if (publishPlayback) taskDownloader.getOrCreatePlaybackId(task);
+    if (operation === 'download') {
+      await taskDownloader.startDownload(
+        task,
+        updateTask,
+        signal,
+        publishPlayback
+      );
+      if (signal.aborted || deletingTasks.has(task.id)) return;
+    }
 
-    if (exportToMp4) {
+    if (publishPlayback) {
       task.status = 'remuxing';
       task.errorMessage = undefined;
       task.updatedAt = new Date();
       updateTask(task);
-      await taskDownloader.remuxToMp4(task, signal);
+      await taskDownloader.publishHls(task, signal);
       if (signal.aborted || deletingTasks.has(task.id)) return;
+      if (!taskDownloader.getPlaybackUrl(task)) {
+        throw new Error('HLS 兼容播放页尚未发布完成');
+      }
     }
 
     task.status = 'completed';
@@ -196,9 +258,14 @@ async function processTask(
     updateTask(task);
   } catch (error) {
     if (signal.aborted || deletingTasks.has(task.id)) return;
+    const wasPublishing = task.status === 'remuxing';
     task.status = 'error';
+    const message =
+      error instanceof Error ? error.message : '离线下载或 HLS 兼容播放发布失败';
     task.errorMessage =
-      error instanceof Error ? error.message : '离线下载或 MP4 封装失败';
+      wasPublishing
+        ? `HLS 兼容播放发布失败：${message}`
+        : message;
     task.updatedAt = new Date();
     tasks.set(task.id, task);
     try {
@@ -215,20 +282,22 @@ function scheduleQueuedTasks(): void {
 
   queueRunner = Promise.resolve()
     .then(async () => {
-      let nextTask = getNextQueuedTask();
-      while (nextTask) {
+      let nextQueuedTask = getNextQueuedTask();
+      while (nextQueuedTask) {
+        const { task, operation } = nextQueuedTask;
         const controller = new AbortController();
-        cancellationControllers.set(nextTask.id, controller);
-        const work = processTask(nextTask, controller.signal);
-        activeDownloads.set(nextTask.id, work);
+        cancellationControllers.set(task.id, controller);
+        const work = processTask(task, controller.signal, operation);
+        activeDownloads.set(task.id, work);
 
         try {
           await work;
         } finally {
-          activeDownloads.delete(nextTask.id);
-          cancellationControllers.delete(nextTask.id);
+          activeDownloads.delete(task.id);
+          cancellationControllers.delete(task.id);
+          if (operation === 'publish') publicationQueue.delete(task.id);
         }
-        nextTask = getNextQueuedTask();
+        nextQueuedTask = getNextQueuedTask();
       }
     })
     .catch((error) => {
@@ -236,11 +305,7 @@ function scheduleQueuedTasks(): void {
     })
     .finally(() => {
       queueRunner = null;
-      if (
-        Array.from(tasks.values()).some((task) => task.status === 'pending')
-      ) {
-        scheduleQueuedTasks();
-      }
+      if (getNextQueuedTask()) scheduleQueuedTasks();
     });
 }
 
@@ -334,9 +399,11 @@ export async function POST(request: NextRequest) {
     }
 
     if (
-      existingTask?.status === 'pending' ||
-      existingTask?.status === 'downloading' ||
-      existingTask?.status === 'remuxing'
+      existingTask &&
+      (existingTask.status === 'pending' ||
+        existingTask.status === 'downloading' ||
+        existingTask.status === 'remuxing' ||
+        activeDownloads.has(existingTask.id))
     ) {
       return NextResponse.json(
         { task: serializeTask(existingTask), message: '该视频已在缓存队列中' },
@@ -354,16 +421,26 @@ export async function POST(request: NextRequest) {
       const previousStatus = existingTask.status;
       const previousErrorMessage = existingTask.errorMessage;
       const previousUpdatedAt = existingTask.updatedAt;
-      existingTask.status = 'pending';
+      const previousM3u8Url = existingTask.m3u8Url;
+      const previousWasQueuedForPublication = publicationQueue.has(existingTask.id);
+      const publishExisting =
+        Boolean(OFFLINE_DOWNLOAD_EXPORT_DIR) && hasReusableCache(existingTask);
+      existingTask.status = publishExisting ? 'remuxing' : 'pending';
+      existingTask.m3u8Url = parsedUrl.href;
       existingTask.errorMessage = undefined;
       existingTask.updatedAt = new Date();
       tasks.set(existingTask.id, existingTask);
+      if (publishExisting) publicationQueue.add(existingTask.id);
+      else publicationQueue.delete(existingTask.id);
       try {
         saveTasks();
       } catch (error) {
         existingTask.status = previousStatus;
         existingTask.errorMessage = previousErrorMessage;
         existingTask.updatedAt = previousUpdatedAt;
+        existingTask.m3u8Url = previousM3u8Url;
+        if (previousWasQueuedForPublication) publicationQueue.add(existingTask.id);
+        else publicationQueue.delete(existingTask.id);
         return NextResponse.json(
           { error: error instanceof Error ? error.message : '任务状态保存失败' },
           { status: 507 }
@@ -371,7 +448,12 @@ export async function POST(request: NextRequest) {
       }
       scheduleQueuedTasks();
       return NextResponse.json(
-        { task: serializeTask(existingTask), message: '已加入服务器缓存队列' },
+        {
+          task: serializeTask(existingTask),
+          message: publishExisting
+            ? '已加入 HLS 兼容播放发布队列'
+            : '已加入服务器缓存队列',
+        },
         { status: 202 }
       );
     }
@@ -449,6 +531,7 @@ export async function DELETE(request: NextRequest) {
     getDownloader().requestCancel(taskId);
     const activeWork = activeDownloads.get(taskId);
     if (activeWork) await activeWork;
+    publicationQueue.delete(taskId);
 
     await getDownloader().deleteTask(task);
     tasks.delete(taskId);
@@ -529,10 +612,15 @@ export async function PUT(request: NextRequest) {
     const previousStatus = task.status;
     const previousErrorMessage = task.errorMessage;
     const previousUpdatedAt = task.updatedAt;
-    task.status = 'pending';
+    const previousWasQueuedForPublication = publicationQueue.has(taskId);
+    const publishExisting =
+      Boolean(OFFLINE_DOWNLOAD_EXPORT_DIR) && hasReusableCache(task);
+    task.status = publishExisting ? 'remuxing' : 'pending';
     task.errorMessage = undefined;
     task.updatedAt = new Date();
     tasks.set(taskId, task);
+    if (publishExisting) publicationQueue.add(taskId);
+    else publicationQueue.delete(taskId);
     try {
       saveTasks();
     } catch (error) {
@@ -540,6 +628,8 @@ export async function PUT(request: NextRequest) {
       task.errorMessage = previousErrorMessage;
       task.updatedAt = previousUpdatedAt;
       tasks.set(taskId, task);
+      if (previousWasQueuedForPublication) publicationQueue.add(taskId);
+      else publicationQueue.delete(taskId);
       return NextResponse.json(
         { error: error instanceof Error ? error.message : '任务状态保存失败' },
         { status: 507 }
@@ -548,7 +638,12 @@ export async function PUT(request: NextRequest) {
     scheduleQueuedTasks();
 
     return NextResponse.json(
-      { task: serializeTask(task), message: '已重新加入服务器缓存队列' },
+      {
+        task: serializeTask(task),
+        message: publishExisting
+          ? '已重新加入 HLS 兼容播放发布队列'
+          : '已重新加入服务器缓存队列',
+      },
       { status: 202 }
     );
   } catch (error) {

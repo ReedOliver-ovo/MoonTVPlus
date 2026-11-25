@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>MoonTVPlus 离线播放</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        background: #0b1020;
+        color: #f4f6fb;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        min-height: 100vh;
+        margin: 0;
+        padding: 24px;
+        display: grid;
+        place-items: center;
+      }
+
+      main {
+        width: min(100%, 960px);
+      }
+
+      h1 {
+        margin: 0 0 16px;
+        font-size: clamp(1.25rem, 3vw, 1.8rem);
+        font-weight: 650;
+      }
+
+      video {
+        display: block;
+        width: 100%;
+        max-height: 78vh;
+        aspect-ratio: 16 / 9;
+        border-radius: 12px;
+        background: #000;
+        object-fit: contain;
+      }
+
+      .status {
+        min-height: 1.5em;
+        margin: 14px 2px 0;
+        color: #b8c2d8;
+        line-height: 1.5;
+      }
+
+      .status.error {
+        color: #ffb4ab;
+      }
+
+      @media (max-width: 600px) {
+        body {
+          display: block;
+          padding: max(16px, env(safe-area-inset-top)) 12px 12px;
+        }
+
+        video {
+          max-height: 70vh;
+          border-radius: 8px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>MoonTVPlus 离线播放</h1>
+      <video id="player" controls playsinline webkit-playsinline preload="metadata"></video>
+      <p id="status" class="status" role="status">正在载入缓存视频…</p>
+    </main>
+
+    <script>
+      (() => {
+        const player = document.getElementById("player");
+        const status = document.getElementById("status");
+        const uuidPattern =
+          /^\/media\/compat\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$/;
+        const match = window.location.pathname.match(uuidPattern);
+
+        const showError = (message) => {
+          status.classList.add("error");
+          status.textContent = message;
+        };
+
+        if (!match) {
+          player.hidden = true;
+          showError("播放地址无效。");
+          return;
+        }
+
+        const source = `/media/hls/${match[1]}/index.m3u8`;
+        const nativeHls =
+          player.canPlayType("application/vnd.apple.mpegurl") ||
+          player.canPlayType("application/x-mpegURL");
+
+        player.addEventListener("loadedmetadata", () => {
+          status.textContent = "";
+        });
+        player.addEventListener("error", () => {
+          showError("视频无法载入，请确认缓存仍存在后重试。");
+        });
+
+        if (nativeHls) {
+          player.src = source;
+          return;
+        }
+
+        const script = document.createElement("script");
+        script.src = "/media/player/hls.min.js";
+        script.async = true;
+        script.onload = () => {
+          if (!window.Hls || !window.Hls.isSupported()) {
+            showError("当前浏览器不支持 HLS 播放。");
+            return;
+          }
+
+          const hls = new window.Hls();
+          hls.on(window.Hls.Events.MANIFEST_PARSED, () => {
+            status.textContent = "";
+          });
+          hls.on(window.Hls.Events.ERROR, (_event, data) => {
+            if (data.fatal) {
+              hls.destroy();
+              showError("HLS 视频载入失败，请稍后重试。");
+            }
+          });
+          hls.loadSource(source);
+          hls.attachMedia(player);
+        };
+        script.onerror = () => {
+          showError("播放器资源载入失败，请刷新后重试。");
+        };
+        document.head.appendChild(script);
+      })();
+    </script>
+  </body>
+</html>
