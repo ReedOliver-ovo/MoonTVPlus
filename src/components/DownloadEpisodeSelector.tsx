@@ -201,7 +201,7 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
         <div className='flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700'>
           <div className='flex-1'>
             <h2 className='text-xl font-bold text-gray-900 dark:text-gray-100'>
-              选择要下载的集数
+              {forceOfflineMode ? '选择缓存集数' : '选择要下载的集数'}
             </h2>
             <p className='text-sm text-gray-500 dark:text-gray-400 mt-1'>
               {videoTitle}
@@ -408,7 +408,7 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
                     }
                     return title;
                   })()}
-                  {isCurrent && (
+                  {isCurrent && !forceOfflineMode && (
                     <span className='absolute -top-1 -right-1 w-2 h-2 bg-blue-500 rounded-full'></span>
                   )}
                   {downloadState ? (
@@ -435,15 +435,21 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
         ) : null}
 
         {/* 底部操作栏 */}
-        <div className='flex items-center justify-between px-6 py-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900'>
-          <div className='text-sm text-gray-600 dark:text-gray-400'>
+        <div
+          className={`${
+            forceOfflineMode
+              ? 'flex flex-col items-stretch gap-3 px-4 py-3 sm:px-6 sm:py-4'
+              : 'flex items-center justify-between px-6 py-4'
+          } border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900`}
+        >
+          <div className={`${forceOfflineMode ? 'text-xs sm:text-sm' : 'text-sm'} text-gray-600 dark:text-gray-400`}>
             已选择：
             {selectedEpisodes.size === 0 ? (
               <span className='text-red-500 dark:text-red-400'>未选择任何集数</span>
             ) : selectedEpisodes.size === 1 ? (
               <>
                 第 {Array.from(selectedEpisodes)[0] + 1} 集
-                {Array.from(selectedEpisodes)[0] === currentEpisodeIndex && (
+                {!forceOfflineMode && Array.from(selectedEpisodes)[0] === currentEpisodeIndex && (
                   <span className='ml-2 text-blue-500 dark:text-blue-400'>(当前播放)</span>
                 )}
               </>
@@ -453,17 +459,17 @@ const DownloadEpisodeSelector: React.FC<DownloadEpisodeSelectorProps> = ({
             </span>
             )}
           </div>
-          <div className='flex gap-3'>
+          <div className={`flex gap-3 ${forceOfflineMode ? 'justify-end' : ''}`}>
             <button
               onClick={onClose}
-              className='px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 rounded-md transition-colors'
+              className={`px-4 py-2 text-sm font-medium text-gray-700 bg-gray-200 hover:bg-gray-300 dark:bg-gray-700 dark:text-gray-300 dark:hover:bg-gray-600 rounded-md transition-colors ${forceOfflineMode ? 'shrink-0 whitespace-nowrap' : ''}`}
             >
               取消
             </button>
             <button
               onClick={handleDownload}
               disabled={selectedEpisodes.size === 0 || isSubmitting || offlineStatesLoading}
-              className={`px-4 py-2 text-sm font-medium text-white rounded-md transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed ${
+              className={`px-4 py-2 text-sm font-medium text-white rounded-md transition-colors shadow-md disabled:opacity-50 disabled:cursor-not-allowed ${forceOfflineMode ? 'shrink-0 whitespace-nowrap' : ''} ${
                 isServerDownload && enableOfflineDownload && hasOfflinePermission
                   ? 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-700 dark:hover:bg-blue-800'
                   : 'bg-green-500 hover:bg-green-600 dark:bg-green-600 dark:hover:bg-green-700 disabled:hover:bg-green-500'
